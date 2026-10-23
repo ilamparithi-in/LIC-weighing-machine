@@ -118,9 +118,28 @@ void setup() {
     while (1) delay(1000);
   }
 
-  // Set internal LDO to 3.0V and PGA to 64x (64x gives 2x the headroom of 128x to prevent rail saturation)
-  scale.setConfig(LDO_3_0V, PGA_64);
-  scale.setSampleRate(CRS_80);
+  // Set internal LDO to 3.0V (provides ~300mV headroom below 3.3V VIN for clean, ripple-free LDO regulation)
+  scale.setConfig(LDO_3_0V, PGA_128);
+
+  // CRITICAL NOISE FIX 1: Set conversion rate to 10 SPS!
+  // At 10 SPS, the NAU7802 enables its internal digital FIR notch filter with -90 dB
+  // simultaneous rejection of 50Hz and 60Hz AC mains hum (room lights, USB ripple).
+  scale.setSampleRate(CRS_10);
+
+  // CRITICAL NOISE FIX 2: Enable Chopper Stabilization (clear bits 4 & 5 in ADC_CTRL1)
+  // The 7Semi library disabled chopper (0x30), which causes huge 1/f flicker noise.
+  Wire.beginTransmission(0x2A);
+  Wire.write(0x15); // REG_ADC_CTRL1
+  Wire.endTransmission(false);
+  if (Wire.requestFrom((uint8_t)0x2A, (uint8_t)1) == 1) {
+    uint8_t ctrl1 = Wire.read();
+    ctrl1 &= ~0x30; // Clear bits 4 and 5 to turn chopper ON
+    Wire.beginTransmission(0x2A);
+    Wire.write(0x15);
+    Wire.write(ctrl1);
+    Wire.endTransmission();
+    Serial.printf("[INFO] Chopper enabled. ADC_CTRL1 = 0x%02X\n", ctrl1);
+  }
 
   // Force-enable the NAU7802 internal LDO by setting AVDDS (bit 7 of REG_PU_CTRL)
   enableInternalLDO();
@@ -185,16 +204,18 @@ void loop() {
       int32_t netCounts = latestRawADC - tareOffset;
       float targetWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
 
-      // Snappy filter: responsive with light jitter suppression
+      // Two-tier filter:
+      // - If weight changes by > 1.5g (real object placed/removed), jump immediately.
+      // - If variation is small (< 1.5g, micro-noise/vibration), smooth it heavily.
       float delta = abs(targetWeight - filteredWeight);
-      if (delta > 0.15f) {
-        filteredWeight = targetWeight; // Instant response
+      if (delta > 1.5f) {
+        filteredWeight = (0.70f * targetWeight) + (0.30f * filteredWeight); // Fast tracking
       } else {
-        filteredWeight = (0.60f * targetWeight) + (0.40f * filteredWeight);
+        filteredWeight = (0.15f * targetWeight) + (0.85f * filteredWeight); // Rock-solid steady baseline
       }
 
       // Snap to 0.00g near zero
-      if (abs(filteredWeight) < 0.05f) {
+      if (abs(filteredWeight) < 0.20f) {
         filteredWeight = 0.0f;
       }
       newSampleAvailable = true;
