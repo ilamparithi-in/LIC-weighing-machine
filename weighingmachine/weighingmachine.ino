@@ -179,31 +179,33 @@ void loop() {
       int32_t netCounts = latestRawADC - tareOffset;
       float targetWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
 
-      // Smart Adaptive Filter:
-      // If weight changes significantly (> 0.4g), jump INSTANTLY with 0 lag!
-      // If weight is settling, apply gentle smoothing to lock the last digit.
+      // Snappy filter: responsive with light jitter suppression
       float delta = abs(targetWeight - filteredWeight);
-      if (delta > 0.4f) {
-        filteredWeight = targetWeight; // Instant jump
+      if (delta > 0.15f) {
+        filteredWeight = targetWeight; // Instant response
       } else {
-        filteredWeight = (0.35f * targetWeight) + (0.65f * filteredWeight);
+        filteredWeight = (0.60f * targetWeight) + (0.40f * filteredWeight);
       }
 
-      // Snap to 0.0g near zero
-      if (abs(filteredWeight) < 0.1f) {
+      // Snap to 0.00g near zero
+      if (abs(filteredWeight) < 0.05f) {
         filteredWeight = 0.0f;
       }
       newSampleAvailable = true;
     }
   }
 
-  // 4. Refresh LCD at snappy ~12 Hz (every 80ms)
+  // 4. Refresh LCD at exact 250ms intervals
   if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
     lastDisplayUpdate = millis();
 
+    static bool tick = false;
+    tick = !tick;
+
     int32_t netCounts = latestRawADC - tareOffset;
     char lineBuf[17];
-    snprintf(lineBuf, sizeof(lineBuf), "Wt: %7.1f g", filteredWeight);
+    // Line 0: Weight with 2 decimal places and a heartbeat indicator in top right
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%7.2fg  %c", filteredWeight, tick ? '*' : ' ');
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
 
