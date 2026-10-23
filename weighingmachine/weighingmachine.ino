@@ -8,8 +8,8 @@
  * 3V3                     VIN                    -
  * 5V / VBUS               -                      VCC (or 3V3 if contrast allows)
  * GND                     GND                    GND
- * GPIO 4 (SDA)            SDA                    SDA
- * GPIO 5 (SCL)            SCL                    SCL
+ * GPIO 6 (SDA)            SDA                    SDA
+ * GPIO 7 (SCL)            SCL                    SCL
  * 
  * Note: The onboard BOOT button (GPIO 9) is used as the TARE button!
  * No external push button wiring is needed.
@@ -31,8 +31,8 @@
 #include <Preferences.h>
 
 // ---------------------- PIN DEFINITIONS ----------------------
-#define I2C_SDA_PIN        4     // Clean I2C SDA (GPIO 4)
-#define I2C_SCL_PIN        5     // Clean I2C SCL (GPIO 5)
+#define I2C_SDA_PIN        6     // Clean I2C SDA (GPIO 6)
+#define I2C_SCL_PIN        7     // Clean I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
 
 // ---------------------- OBJECTS & STORAGE --------------------
