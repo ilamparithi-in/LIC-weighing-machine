@@ -44,7 +44,7 @@ uint8_t lcdAddress = 0x27;
 const char* PREFS_NAMESPACE = "scale_cfg";
 float scaleFactor = 420.0f;      // Default scale factor (counts per gram)
 int32_t tareOffset = 0;
-bool isCalibrated = true;        // Default to true so it works immediately
+bool isCalibrated = true;
 
 // Tare button interrupt flag
 volatile bool tareRequested = false;
@@ -62,13 +62,13 @@ void IRAM_ATTR handleTareInterrupt() {
 unsigned long lastDisplayUpdate = 0;
 const unsigned long DISPLAY_INTERVAL_MS = 250;  // Refresh LCD every 250ms (4 Hz)
 float filteredWeight = 0.0f;
-float latestRawWeight = 0.0f;
 int32_t latestRawADC = 0;
 bool newSampleAvailable = false;
 
 // ---------------------- FORWARD DECLARATIONS -----------------
 void scanAndInitI2C();
 void enableInternalLDO();
+void calibrateAFE();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
 void loadSettings();
@@ -77,7 +77,10 @@ void printHelp();
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  // CRITICAL FIX: Disable TX blocking on ESP32-C3 native USB CDC so the loop
+  // never stalls when the serial monitor/terminal is closed!
+  Serial.setTxTimeoutMs(0);
+  delay(500);
 
   Serial.println();
   Serial.println("===============================================");
@@ -115,12 +118,15 @@ void setup() {
     while (1) delay(1000);
   }
 
-  // Set internal LDO to 3.0V (gives reliable regulation with 3.3V VIN) and PGA to 128
-  scale.setConfig(LDO_3_0V, PGA_128);
+  // Set internal LDO to 3.0V and PGA to 64x (64x gives 2x the headroom of 128x to prevent rail saturation)
+  scale.setConfig(LDO_3_0V, PGA_64);
   scale.setSampleRate(CRS_80);
 
   // Force-enable the NAU7802 internal LDO by setting AVDDS (bit 7 of REG_PU_CTRL)
   enableInternalLDO();
+
+  // Run internal Analog Front-End (AFE) offset calibration
+  calibrateAFE();
 
   // Load saved calibration or set reasonable default
   loadSettings();
@@ -131,7 +137,7 @@ void setup() {
   lcd->print("Taring scale...");
   lcd->setCursor(0, 1);
   lcd->print("Keep plate empty");
-  delay(800);
+  delay(600);
 
   performTare();
 
@@ -146,7 +152,7 @@ void loop() {
     performTare();
   }
 
-  // 2. Check Serial Commands
+  // 2. Check Serial Commands (if serial port has data)
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -171,7 +177,7 @@ void loop() {
     }
   }
 
-  // 3. Continuously acquire ADC data at 80 SPS as fast as conversions finish
+  // 3. Continuously acquire ADC data at 80 SPS
   if (scale.available()) {
     int32_t val = 0;
     if (scale.readRaw(val, 5)) {
@@ -204,7 +210,7 @@ void loop() {
 
     int32_t netCounts = latestRawADC - tareOffset;
     char lineBuf[17];
-    // Line 0: Weight with 2 decimal places and a heartbeat indicator in top right
+    // Line 0: Weight with 2 decimal places and heartbeat indicator in top right
     snprintf(lineBuf, sizeof(lineBuf), "Wt:%7.2fg  %c", filteredWeight, tick ? '*' : ' ');
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
@@ -217,9 +223,12 @@ void loop() {
       lcd->print(lineBuf);
     }
 
+    // Only send serial if buffer is ready (never blocks!)
     if (newSampleAvailable) {
       newSampleAvailable = false;
-      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld\n", filteredWeight, (long)latestRawADC, (long)netCounts);
+      if (Serial.availableForWrite() >= 64) {
+        Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld\n", filteredWeight, (long)latestRawADC, (long)netCounts);
+      }
     }
   }
 }
@@ -228,8 +237,6 @@ void loop() {
 
 /**
  * Ensures the NAU7802 internal LDO is powered up and routed to AVDD.
- * The 7Semi library clears bit 7 (AVDDS) by writing 0x06, which turns off the LDO.
- * Setting AVDDS = 1 turns the internal LDO back ON.
  */
 void enableInternalLDO() {
   Wire.beginTransmission(0x2A);
@@ -243,6 +250,34 @@ void enableInternalLDO() {
     Wire.write(pu);
     Wire.endTransmission();
     Serial.printf("[INFO] Internal LDO enabled. PU_CTRL = 0x%02X\n", pu);
+  }
+}
+
+/**
+ * Runs internal AFE offset calibration to cancel amplifier DC offset.
+ */
+void calibrateAFE() {
+  Wire.beginTransmission(0x2A);
+  Wire.write(0x02); // REG_CTRL2
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)0x2A, (uint8_t)1) == 1) {
+    uint8_t c2 = Wire.read();
+    c2 &= 0xFC; // CALMOD = 00 (Offset calibration)
+    c2 |= (1 << 2); // CALS = 1 (Start calibration)
+    Wire.beginTransmission(0x2A);
+    Wire.write(0x02);
+    Wire.write(c2);
+    Wire.endTransmission();
+
+    unsigned long start = millis();
+    while (millis() - start < 400) {
+      Wire.beginTransmission(0x2A);
+      Wire.write(0x02);
+      if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)0x2A, (uint8_t)1) == 1) {
+        if ((Wire.read() & (1 << 2)) == 0) break; // Finished
+      }
+      delay(10);
+    }
+    Serial.println("[INFO] AFE internal offset calibration complete.");
   }
 }
 
@@ -357,7 +392,7 @@ void loadSettings() {
   prefs.begin(PREFS_NAMESPACE, true);
   scaleFactor = prefs.getFloat("scale_factor", 420.0f);
   tareOffset = prefs.getInt("tare_offset", 0);
-  isCalibrated = prefs.getBool("calibrated", true); // Default to ready
+  isCalibrated = prefs.getBool("calibrated", true);
   prefs.end();
 
   if (scaleFactor == 0.0f) scaleFactor = 420.0f;
