@@ -58,11 +58,13 @@ void IRAM_ATTR handleTareInterrupt() {
   }
 }
 
-// Sampling & Smoothing
+// Sampling & Refresh rates
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_INTERVAL_MS = 150;
+const unsigned long DISPLAY_INTERVAL_MS = 80;   // Refresh LCD at snappy ~12 Hz
 float filteredWeight = 0.0f;
-const float SMOOTHING_ALPHA = 0.30f;
+float latestRawWeight = 0.0f;
+int32_t latestRawADC = 0;
+bool newSampleAvailable = false;
 
 // ---------------------- FORWARD DECLARATIONS -----------------
 void scanAndInitI2C();
@@ -169,40 +171,53 @@ void loop() {
     }
   }
 
-  // 3. Periodic reading and LCD update
-  if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
-    lastDisplayUpdate = millis();
+  // 3. Continuously acquire ADC data at 80 SPS as fast as conversions finish
+  if (scale.available()) {
+    int32_t val = 0;
+    if (scale.readRaw(val, 5)) {
+      latestRawADC = val;
+      int32_t netCounts = latestRawADC - tareOffset;
+      float targetWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
 
-    int32_t rawVal = 0;
-    if (scale.readRaw(rawVal, 50)) {
-      int32_t netCounts = rawVal - tareOffset;
-      float currentWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
+      // Smart Adaptive Filter:
+      // If weight changes significantly (> 0.4g), jump INSTANTLY with 0 lag!
+      // If weight is settling, apply gentle smoothing to lock the last digit.
+      float delta = abs(targetWeight - filteredWeight);
+      if (delta > 0.4f) {
+        filteredWeight = targetWeight; // Instant jump
+      } else {
+        filteredWeight = (0.35f * targetWeight) + (0.65f * filteredWeight);
+      }
 
-      // Exponential Moving Average filter
-      filteredWeight = (SMOOTHING_ALPHA * currentWeight) + ((1.0f - SMOOTHING_ALPHA) * filteredWeight);
-
-      // Deadband snap near zero
+      // Snap to 0.0g near zero
       if (abs(filteredWeight) < 0.1f) {
         filteredWeight = 0.0f;
       }
+      newSampleAvailable = true;
+    }
+  }
 
-      // Display on LCD Line 0: Weight
-      char lineBuf[17];
-      snprintf(lineBuf, sizeof(lineBuf), "Wt: %7.1f g", filteredWeight);
-      lcd->setCursor(0, 0);
+  // 4. Refresh LCD at snappy ~12 Hz (every 80ms)
+  if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
+    lastDisplayUpdate = millis();
+
+    int32_t netCounts = latestRawADC - tareOffset;
+    char lineBuf[17];
+    snprintf(lineBuf, sizeof(lineBuf), "Wt: %7.1f g", filteredWeight);
+    lcd->setCursor(0, 0);
+    lcd->print(lineBuf);
+
+    lcd->setCursor(0, 1);
+    if (latestRawADC == -8388608 || latestRawADC == 8388607) {
+      lcd->print("ADC SATURATED!  ");
+    } else {
+      snprintf(lineBuf, sizeof(lineBuf), "Net:%6ld [%c] ", (long)netCounts, isCalibrated ? 'R' : 'U');
       lcd->print(lineBuf);
+    }
 
-      // Display on LCD Line 1: Status & Net ADC count
-      lcd->setCursor(0, 1);
-      if (rawVal == -8388608 || rawVal == 8388607) {
-        lcd->print("ADC SATURATED!  ");
-      } else {
-        snprintf(lineBuf, sizeof(lineBuf), "Net:%6ld [%c] ", (long)netCounts, isCalibrated ? 'R' : 'U');
-        lcd->print(lineBuf);
-      }
-
-      // Serial diagnostics
-      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld\n", filteredWeight, (long)rawVal, (long)netCounts);
+    if (newSampleAvailable) {
+      newSampleAvailable = false;
+      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld\n", filteredWeight, (long)latestRawADC, (long)netCounts);
     }
   }
 }
