@@ -60,7 +60,7 @@ void IRAM_ATTR handleTareInterrupt() {
 
 // Sampling & Refresh rates
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_INTERVAL_MS = 80;   // Refresh LCD at snappy ~12 Hz
+const unsigned long DISPLAY_INTERVAL_MS = 250;  // Refresh LCD every 250ms (4 Hz)
 float filteredWeight = 0.0f;
 float latestRawWeight = 0.0f;
 int32_t latestRawADC = 0;
