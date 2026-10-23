@@ -6,13 +6,13 @@
  * ESP32-C3 SuperMini      7Semi NAU7802          I2C LCD 16x2 (PCF8574)
  * --------------------------------------------------------------------
  * 3V3                     VIN                    -
+ * 3V3 (or internal LDO)   AVDD (Excitation)      -
  * 5V / VBUS               -                      VCC (or 3V3 if contrast allows)
  * GND                     GND                    GND
  * GPIO 6 (SDA)            SDA                    SDA
  * GPIO 7 (SCL)            SCL                    SCL
  * 
  * Note: The onboard BOOT button (GPIO 9) is used as the TARE button!
- * No external push button wiring is needed.
  *
  * Load Cell (Standard 4-Wire) to 7Semi NAU7802:
  * --------------------------------------------------------------------
@@ -20,7 +20,6 @@
  * E- (Excitation -) -> BLACK
  * A+ (Signal +)     -> GREEN
  * A- (Signal -)     -> WHITE
- * (If weight reading goes negative when adding weight, swap A+ and A-)
  * ====================================================================
  */
 
@@ -31,8 +30,8 @@
 #include <Preferences.h>
 
 // ---------------------- PIN DEFINITIONS ----------------------
-#define I2C_SDA_PIN        6     // Clean I2C SDA (GPIO 6)
-#define I2C_SCL_PIN        7     // Clean I2C SCL (GPIO 7)
+#define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
+#define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
 
 // ---------------------- OBJECTS & STORAGE --------------------
@@ -41,20 +40,33 @@ LiquidCrystal_I2C *lcd = nullptr;
 Preferences prefs;
 
 // ---------------------- CONFIG & CALIBRATION -----------------
-uint8_t lcdAddress = 0x27;       // Auto-detected between 0x27 and 0x3F
+uint8_t lcdAddress = 0x27;
 const char* PREFS_NAMESPACE = "scale_cfg";
 float scaleFactor = 420.0f;      // Default scale factor (counts per gram)
 int32_t tareOffset = 0;
-bool isCalibrated = false;
+bool isCalibrated = true;        // Default to true so it works immediately
+
+// Tare button interrupt flag
+volatile bool tareRequested = false;
+volatile unsigned long lastTareInterruptTime = 0;
+
+void IRAM_ATTR handleTareInterrupt() {
+  unsigned long now = millis();
+  if (now - lastTareInterruptTime > 300) {
+    tareRequested = true;
+    lastTareInterruptTime = now;
+  }
+}
 
 // Sampling & Smoothing
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_INTERVAL_MS = 200; // Refresh LCD every 200ms
+const unsigned long DISPLAY_INTERVAL_MS = 150;
 float filteredWeight = 0.0f;
-const float SMOOTHING_ALPHA = 0.35f;           // EMA filter factor (0.1 = smooth, 0.9 = fast)
+const float SMOOTHING_ALPHA = 0.30f;
 
 // ---------------------- FORWARD DECLARATIONS -----------------
 void scanAndInitI2C();
+void enableInternalLDO();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
 void loadSettings();
@@ -70,10 +82,11 @@ void setup() {
   Serial.println(" ESP32-C3 SuperMini + NAU7802 + I2C LCD Scale ");
   Serial.println("===============================================");
 
-  // Initialize Tare Button
+  // Initialize BOOT button as Tare with Hardware Interrupt
   pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(TARE_BUTTON_PIN), handleTareInterrupt, FALLING);
 
-  // Initialize I2C Bus on specified ESP32-C3 pins
+  // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
   delay(50);
 
@@ -97,26 +110,26 @@ void setup() {
     lcd->print("NAU7802 ERROR!");
     lcd->setCursor(0, 1);
     lcd->print("Check Wiring");
-    while (1) {
-      delay(1000);
-    }
+    while (1) delay(1000);
   }
 
-  // Configure LDO 3.3V and Gain 128 (optimal for 4-wire strain gauge load cells)
-  scale.setConfig(LDO_3_3V, PGA_128);
-  scale.setSampleRate(CRS_80); // 80 SPS for smooth & responsive updates
-  scale.setSampling(10, 500);
+  // Set internal LDO to 3.0V (gives reliable regulation with 3.3V VIN) and PGA to 128
+  scale.setConfig(LDO_3_0V, PGA_128);
+  scale.setSampleRate(CRS_80);
 
-  // Load saved calibration from flash
+  // Force-enable the NAU7802 internal LDO by setting AVDDS (bit 7 of REG_PU_CTRL)
+  enableInternalLDO();
+
+  // Load saved calibration or set reasonable default
   loadSettings();
 
-  // Show status on LCD
+  // Initial zero tare
   lcd->clear();
   lcd->setCursor(0, 0);
   lcd->print("Taring scale...");
   lcd->setCursor(0, 1);
   lcd->print("Keep plate empty");
-  delay(1000);
+  delay(800);
 
   performTare();
 
@@ -125,10 +138,9 @@ void setup() {
 }
 
 void loop() {
-  // 1. Check physical Tare button (active LOW with debouncing)
-  static unsigned long lastBtnPress = 0;
-  if (digitalRead(TARE_BUTTON_PIN) == LOW && (millis() - lastBtnPress > 400)) {
-    lastBtnPress = millis();
+  // 1. Check Tare request (from physical BOOT button interrupt or Serial)
+  if (tareRequested) {
+    tareRequested = false;
     performTare();
   }
 
@@ -149,8 +161,8 @@ void loop() {
     } else if (cmd.equalsIgnoreCase("r") || cmd.equalsIgnoreCase("raw")) {
       int32_t rawVal = 0;
       if (scale.readRaw(rawVal, 100)) {
-        Serial.printf("[RAW] ADC: %ld | Tare: %ld | ScaleFactor: %.4f\n", 
-                      (long)rawVal, (long)scale.getTareOffset(), scale.getScaleFactor());
+        Serial.printf("[RAW] ADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n", 
+                      (long)rawVal, (long)tareOffset, (long)(rawVal - tareOffset), scaleFactor);
       }
     } else if (cmd.equalsIgnoreCase("h") || cmd.equalsIgnoreCase("help")) {
       printHelp();
@@ -161,39 +173,61 @@ void loop() {
   if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
     lastDisplayUpdate = millis();
 
-    float currentWeight = 0.0f;
-    if (scale.getWeight(currentWeight)) {
-      // Exponential Moving Average filter for clean reading display
+    int32_t rawVal = 0;
+    if (scale.readRaw(rawVal, 50)) {
+      int32_t netCounts = rawVal - tareOffset;
+      float currentWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
+
+      // Exponential Moving Average filter
       filteredWeight = (SMOOTHING_ALPHA * currentWeight) + ((1.0f - SMOOTHING_ALPHA) * filteredWeight);
 
-      // Snap near zero to eliminate slight drift noise
-      if (abs(filteredWeight) < 0.05f) {
+      // Deadband snap near zero
+      if (abs(filteredWeight) < 0.1f) {
         filteredWeight = 0.0f;
       }
 
-      // Display on LCD (Line 0: Weight value, Line 1: Status)
+      // Display on LCD Line 0: Weight
       char lineBuf[17];
       snprintf(lineBuf, sizeof(lineBuf), "Wt: %7.1f g", filteredWeight);
       lcd->setCursor(0, 0);
       lcd->print(lineBuf);
 
+      // Display on LCD Line 1: Status & Net ADC count
       lcd->setCursor(0, 1);
-      if (isCalibrated) {
-        lcd->print("Status: READY   ");
+      if (rawVal == -8388608 || rawVal == 8388607) {
+        lcd->print("ADC SATURATED!  ");
       } else {
-        lcd->print("Status: UNCAL   ");
+        snprintf(lineBuf, sizeof(lineBuf), "Net:%6ld [%c] ", (long)netCounts, isCalibrated ? 'R' : 'U');
+        lcd->print(lineBuf);
       }
 
-      // Serial plot output
-      Serial.printf("Weight: %.2f g\n", filteredWeight);
-    } else {
-      lcd->setCursor(0, 0);
-      lcd->print("Reading ADC...  ");
+      // Serial diagnostics
+      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld\n", filteredWeight, (long)rawVal, (long)netCounts);
     }
   }
 }
 
 // ---------------------- HELPER FUNCTIONS ---------------------
+
+/**
+ * Ensures the NAU7802 internal LDO is powered up and routed to AVDD.
+ * The 7Semi library clears bit 7 (AVDDS) by writing 0x06, which turns off the LDO.
+ * Setting AVDDS = 1 turns the internal LDO back ON.
+ */
+void enableInternalLDO() {
+  Wire.beginTransmission(0x2A);
+  Wire.write(0x00); // REG_PU_CTRL
+  if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)0x2A, (uint8_t)1) == 1) {
+    uint8_t pu = Wire.read();
+    pu |= (1 << 7); // AVDDS = 1 (Enable internal LDO)
+    pu |= (1 << 4); // CS = 1 (Cycle start)
+    Wire.beginTransmission(0x2A);
+    Wire.write(0x00);
+    Wire.write(pu);
+    Wire.endTransmission();
+    Serial.printf("[INFO] Internal LDO enabled. PU_CTRL = 0x%02X\n", pu);
+  }
+}
 
 void scanAndInitI2C() {
   Serial.println("[INFO] Scanning I2C bus...");
@@ -223,16 +257,29 @@ void performTare() {
   lcd->setCursor(0, 1);
   lcd->print("TARING...       ");
 
-  int32_t newTare = 0;
-  if (scale.tare(newTare, 30, 2000)) {
-    tareOffset = newTare;
+  // Read average of 15 samples
+  long sum = 0;
+  int validSamples = 0;
+  unsigned long start = millis();
+  while (validSamples < 15 && (millis() - start < 1500)) {
+    int32_t val;
+    if (scale.readRaw(val, 100)) {
+      sum += val;
+      validSamples++;
+    }
+    delay(10);
+  }
+
+  if (validSamples > 0) {
+    tareOffset = sum / validSamples;
+    scale.setTareOffset(tareOffset);
     filteredWeight = 0.0f;
     saveSettings();
-    Serial.printf("[SUCCESS] Tare locked. Offset = %ld\n", (long)tareOffset);
+    Serial.printf("[SUCCESS] Tare locked. Offset = %ld (samples: %d)\n", (long)tareOffset, validSamples);
     lcd->setCursor(0, 1);
     lcd->print("TARE OK!        ");
   } else {
-    Serial.println("[ERROR] Tare failed! ADC timeout or unstable signal.");
+    Serial.println("[ERROR] Tare failed! ADC timeout.");
     lcd->setCursor(0, 1);
     lcd->print("TARE ERROR!     ");
   }
@@ -249,9 +296,25 @@ void calibrateScaleWithWeight(float knownWeight) {
   snprintf(buf, sizeof(buf), "Ref: %.1fg", knownWeight);
   lcd->print(buf);
 
-  if (scale.calibrateScale(knownWeight, 40, 4000)) {
-    scaleFactor = scale.getScaleFactor();
+  // Take average reading with known weight
+  long sum = 0;
+  int validSamples = 0;
+  unsigned long start = millis();
+  while (validSamples < 20 && (millis() - start < 2500)) {
+    int32_t val;
+    if (scale.readRaw(val, 100)) {
+      sum += val;
+      validSamples++;
+    }
+    delay(10);
+  }
+
+  if (validSamples > 0) {
+    int32_t avgVal = sum / validSamples;
+    int32_t net = avgVal - tareOffset;
+    scaleFactor = (float)net / knownWeight;
     isCalibrated = true;
+    scale.setScaleFactor(scaleFactor);
     saveSettings();
     Serial.printf("[SUCCESS] Calibration complete! Factor: %.4f counts/g\n", scaleFactor);
 
@@ -259,7 +322,7 @@ void calibrateScaleWithWeight(float knownWeight) {
     lcd->setCursor(0, 0);
     lcd->print("CAL SUCCESS!");
     lcd->setCursor(0, 1);
-    snprintf(buf, sizeof(buf), "Factor: %.2f", scaleFactor);
+    snprintf(buf, sizeof(buf), "F:%.1f c/g", scaleFactor);
     lcd->print(buf);
   } else {
     Serial.println("[ERROR] Calibration failed. Make sure weight is steady.");
@@ -269,28 +332,29 @@ void calibrateScaleWithWeight(float knownWeight) {
     lcd->setCursor(0, 1);
     lcd->print("Check weight");
   }
-  delay(1500);
+  delay(1200);
   lcd->clear();
 }
 
 void loadSettings() {
-  prefs.begin(PREFS_NAMESPACE, true); // Read-only mode
+  prefs.begin(PREFS_NAMESPACE, true);
   scaleFactor = prefs.getFloat("scale_factor", 420.0f);
   tareOffset = prefs.getInt("tare_offset", 0);
-  isCalibrated = prefs.getBool("calibrated", false);
+  isCalibrated = prefs.getBool("calibrated", true); // Default to ready
   prefs.end();
 
+  if (scaleFactor == 0.0f) scaleFactor = 420.0f;
   scale.setScaleFactor(scaleFactor);
   if (tareOffset != 0) {
     scale.setTareOffset(tareOffset);
   }
 
   Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Calibrated: %s\n",
-                scaleFactor, (long)tareOffset, isCalibrated ? "YES" : "NO (Using default)");
+                scaleFactor, (long)tareOffset, isCalibrated ? "YES" : "NO");
 }
 
 void saveSettings() {
-  prefs.begin(PREFS_NAMESPACE, false); // Read-write mode
+  prefs.begin(PREFS_NAMESPACE, false);
   prefs.putFloat("scale_factor", scaleFactor);
   prefs.putInt("tare_offset", tareOffset);
   prefs.putBool("calibrated", isCalibrated);
@@ -302,7 +366,7 @@ void printHelp() {
   Serial.println();
   Serial.println("--- SERIAL COMMANDS ---");
   Serial.println("  t              : Tare (zero) scale");
-  Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 100' or 'c 500')");
+  Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 100')");
   Serial.println("  r              : Read raw ADC and scale diagnostics");
   Serial.println("  h              : Print this help menu");
   Serial.println("-----------------------");
