@@ -42,7 +42,7 @@ Preferences prefs;
 // ---------------------- CONFIG & CALIBRATION -----------------
 uint8_t lcdAddress = 0x27;
 const char* PREFS_NAMESPACE = "scale_cfg";
-float scaleFactor = 420.0f;      // Default scale factor (counts per gram)
+float scaleFactor = 88.0f;       // Calibrated counts per gram
 int32_t tareOffset = 0;
 bool isCalibrated = true;
 
@@ -52,18 +52,27 @@ volatile unsigned long lastTareInterruptTime = 0;
 
 void IRAM_ATTR handleTareInterrupt() {
   unsigned long now = millis();
-  if (now - lastTareInterruptTime > 300) {
+  if (now - lastTareInterruptTime > 400) {
     tareRequested = true;
     lastTareInterruptTime = now;
   }
 }
 
-// Sampling & Refresh rates
+// ---------------------- DIGITAL FILTER CONFIG ----------------
+// Rolling buffer for raw ADC samples
+const int FILTER_SIZE = 12;
+int32_t adcBuffer[FILTER_SIZE];
+int bufferIndex = 0;
+bool bufferFull = false;
+
+// Display and stability variables
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_INTERVAL_MS = 250;  // Refresh LCD every 250ms (4 Hz)
+const unsigned long DISPLAY_INTERVAL_MS = 250;  // 4 Hz LCD update rate
 float filteredWeight = 0.0f;
-int32_t latestRawADC = 0;
-bool newSampleAvailable = false;
+float lockedWeight = 0.0f;
+bool isStable = false;
+int stableFrames = 0;
+int32_t latestFilteredADC = 0;
 
 // ---------------------- FORWARD DECLARATIONS -----------------
 void scanAndInitI2C();
@@ -74,11 +83,10 @@ void calibrateScaleWithWeight(float knownWeight);
 void loadSettings();
 void saveSettings();
 void printHelp();
+int32_t getTrimmedMeanADC();
 
 void setup() {
   Serial.begin(115200);
-  // CRITICAL FIX: Disable TX blocking on ESP32-C3 native USB CDC so the loop
-  // never stalls when the serial monitor/terminal is closed!
   Serial.setTxTimeoutMs(0);
   delay(500);
 
@@ -118,27 +126,23 @@ void setup() {
     while (1) delay(1000);
   }
 
-  // Set internal LDO to 3.0V (provides ~300mV headroom below 3.3V VIN for clean, ripple-free LDO regulation)
+  // Set internal LDO to 3.0V (provides ~300mV headroom below 3.3V VIN for clean regulation)
   scale.setConfig(LDO_3_0V, PGA_128);
 
-  // CRITICAL NOISE FIX 1: Set conversion rate to 10 SPS!
-  // At 10 SPS, the NAU7802 enables its internal digital FIR notch filter with -90 dB
-  // simultaneous rejection of 50Hz and 60Hz AC mains hum (room lights, USB ripple).
+  // Set conversion rate to 10 SPS for built-in 50/60Hz notch filter rejection
   scale.setSampleRate(CRS_10);
 
-  // CRITICAL NOISE FIX 2: Enable Chopper Stabilization (clear bits 4 & 5 in ADC_CTRL1)
-  // The 7Semi library disabled chopper (0x30), which causes huge 1/f flicker noise.
+  // Nuvoton recommended setting for optimal low-noise operation (0x30 in ADC_CTRL1)
   Wire.beginTransmission(0x2A);
   Wire.write(0x15); // REG_ADC_CTRL1
   Wire.endTransmission(false);
   if (Wire.requestFrom((uint8_t)0x2A, (uint8_t)1) == 1) {
     uint8_t ctrl1 = Wire.read();
-    ctrl1 &= ~0x30; // Clear bits 4 and 5 to turn chopper ON
+    ctrl1 |= 0x30; // Set bits 4 & 5 as per Nuvoton 9.1 guidelines
     Wire.beginTransmission(0x2A);
     Wire.write(0x15);
     Wire.write(ctrl1);
     Wire.endTransmission();
-    Serial.printf("[INFO] Chopper enabled. ADC_CTRL1 = 0x%02X\n", ctrl1);
   }
 
   // Force-enable the NAU7802 internal LDO by setting AVDDS (bit 7 of REG_PU_CTRL)
@@ -147,18 +151,32 @@ void setup() {
   // Run internal Analog Front-End (AFE) offset calibration
   calibrateAFE();
 
-  // Load saved calibration or set reasonable default
+  // Load saved calibration and tare offset from flash memory
   loadSettings();
 
-  // Initial zero tare
-  lcd->clear();
-  lcd->setCursor(0, 0);
-  lcd->print("Taring scale...");
-  lcd->setCursor(0, 1);
-  lcd->print("Keep plate empty");
-  delay(600);
+  // If no tare offset has ever been saved, perform initial zero
+  if (tareOffset == 0) {
+    performTare();
+  } else {
+    Serial.printf("[INFO] Preserving saved TareOffset = %ld\n", (long)tareOffset);
+  }
 
-  performTare();
+  // Pre-fill rolling filter buffer with initial samples
+  Serial.println("[INFO] Stabilizing filter buffer...");
+  int filled = 0;
+  unsigned long startFill = millis();
+  while (filled < FILTER_SIZE && (millis() - startFill < 1500)) {
+    int32_t s = 0;
+    if (scale.readRaw(s, 150)) {
+      adcBuffer[filled++] = s;
+    }
+    delay(5);
+  }
+  bufferIndex = 0;
+  bufferFull = (filled == FILTER_SIZE);
+  latestFilteredADC = getTrimmedMeanADC();
+  filteredWeight = (scaleFactor != 0) ? ((float)(latestFilteredADC - tareOffset) / scaleFactor) : 0.0f;
+  lockedWeight = filteredWeight;
 
   lcd->clear();
   printHelp();
@@ -171,7 +189,7 @@ void loop() {
     performTare();
   }
 
-  // 2. Check Serial Commands (if serial port has data)
+  // 2. Check Serial Commands
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
@@ -183,42 +201,55 @@ void loop() {
       if (weight > 0) {
         calibrateScaleWithWeight(weight);
       } else {
-        Serial.println("[ERROR] Enter valid weight, e.g.: c 100");
+        Serial.println("[ERROR] Enter valid weight, e.g.: c 608");
       }
     } else if (cmd.equalsIgnoreCase("r") || cmd.equalsIgnoreCase("raw")) {
-      int32_t rawVal = 0;
-      if (scale.readRaw(rawVal, 100)) {
-        Serial.printf("[RAW] ADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n", 
-                      (long)rawVal, (long)tareOffset, (long)(rawVal - tareOffset), scaleFactor);
-      }
+      int32_t rawVal = getTrimmedMeanADC();
+      Serial.printf("[RAW] FilteredADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n", 
+                    (long)rawVal, (long)tareOffset, (long)(rawVal - tareOffset), scaleFactor);
     } else if (cmd.equalsIgnoreCase("h") || cmd.equalsIgnoreCase("help")) {
       printHelp();
     }
   }
 
-  // 3. Continuously acquire ADC data at 80 SPS
+  // 3. Continuously acquire ADC samples into rolling ring buffer
   if (scale.available()) {
     int32_t val = 0;
     if (scale.readRaw(val, 5)) {
-      latestRawADC = val;
-      int32_t netCounts = latestRawADC - tareOffset;
+      adcBuffer[bufferIndex] = val;
+      bufferIndex = (bufferIndex + 1) % FILTER_SIZE;
+      if (bufferIndex == 0) bufferFull = true;
+
+      // Get trimmed-mean averaged ADC count (eliminates single-sample noise & chopper ripple)
+      latestFilteredADC = getTrimmedMeanADC();
+      int32_t netCounts = latestFilteredADC - tareOffset;
       float targetWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
 
-      // Two-tier filter:
-      // - If weight changes by > 1.5g (real object placed/removed), jump immediately.
-      // - If variation is small (< 1.5g, micro-noise/vibration), smooth it heavily.
+      // Adaptive Smart Filter:
+      // - Real load change (> 2.0g): Fast tracking (50% new sample per frame)
+      // - Resting load (< 2.0g): Smooth filtering (8% new sample per frame)
       float delta = abs(targetWeight - filteredWeight);
-      if (delta > 1.5f) {
-        filteredWeight = (0.70f * targetWeight) + (0.30f * filteredWeight); // Fast tracking
+      if (delta > 2.0f) {
+        filteredWeight = (0.50f * targetWeight) + (0.50f * filteredWeight);
+        isStable = false;
+        stableFrames = 0;
       } else {
-        filteredWeight = (0.15f * targetWeight) + (0.85f * filteredWeight); // Rock-solid steady baseline
+        filteredWeight = (0.08f * targetWeight) + (0.92f * filteredWeight);
+        if (stableFrames < 15) stableFrames++;
+        if (stableFrames >= 4) {
+          isStable = true;
+          // Lock to stable weight with 0.1g hysteresis
+          if (abs(filteredWeight - lockedWeight) > 0.3f) {
+            lockedWeight = filteredWeight;
+          }
+        }
       }
 
       // Snap to 0.00g near zero
-      if (abs(filteredWeight) < 0.20f) {
+      if (abs(filteredWeight) < 0.25f) {
         filteredWeight = 0.0f;
+        lockedWeight = 0.0f;
       }
-      newSampleAvailable = true;
     }
   }
 
@@ -229,32 +260,76 @@ void loop() {
     static bool tick = false;
     tick = !tick;
 
-    int32_t netCounts = latestRawADC - tareOffset;
+    int32_t netCounts = latestFilteredADC - tareOffset;
+    float displayValue = isStable ? lockedWeight : filteredWeight;
+
+    // Line 0: Weight display
     char lineBuf[17];
-    // Line 0: Weight with 2 decimal places and heartbeat indicator in top right
-    snprintf(lineBuf, sizeof(lineBuf), "Wt:%7.2fg  %c", filteredWeight, tick ? '*' : ' ');
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%7.1fg  %c", displayValue, tick ? '*' : ' ');
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
 
+    // Line 1: Status & Net ADC counts
     lcd->setCursor(0, 1);
-    if (latestRawADC == -8388608 || latestRawADC == 8388607) {
+    if (latestFilteredADC <= -8388600 || latestFilteredADC >= 8388600) {
       lcd->print("ADC SATURATED!  ");
     } else {
-      snprintf(lineBuf, sizeof(lineBuf), "Net:%6ld [%c] ", (long)netCounts, isCalibrated ? 'R' : 'U');
+      if (isStable) {
+        snprintf(lineBuf, sizeof(lineBuf), "STABLE  %6ld", (long)netCounts);
+      } else {
+        snprintf(lineBuf, sizeof(lineBuf), "Net:    %6ld", (long)netCounts);
+      }
       lcd->print(lineBuf);
     }
 
-    // Only send serial if buffer is ready (never blocks!)
-    if (newSampleAvailable) {
-      newSampleAvailable = false;
-      if (Serial.availableForWrite() >= 64) {
-        Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld\n", filteredWeight, (long)latestRawADC, (long)netCounts);
-      }
+    // Serial stream output (never blocks!)
+    if (Serial.availableForWrite() >= 64) {
+      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld | %s\n", 
+                    displayValue, (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
     }
   }
 }
 
 // ---------------------- HELPER FUNCTIONS ---------------------
+
+/**
+ * Calculates a trimmed-mean ADC value from the rolling buffer:
+ * Sorts the window, drops the lowest 2 and highest 2 outlier samples,
+ * and averages the middle samples. Completely cancels chopper ripple and spikes.
+ */
+int32_t getTrimmedMeanADC() {
+  int count = bufferFull ? FILTER_SIZE : bufferIndex;
+  if (count <= 0) return 0;
+  if (count < 4) {
+    long sum = 0;
+    for (int i = 0; i < count; i++) sum += adcBuffer[i];
+    return sum / count;
+  }
+
+  int32_t sorted[FILTER_SIZE];
+  for (int i = 0; i < count; i++) sorted[i] = adcBuffer[i];
+
+  // Simple insertion sort
+  for (int i = 1; i < count; i++) {
+    int32_t key = sorted[i];
+    int j = i - 1;
+    while (j >= 0 && sorted[j] > key) {
+      sorted[j + 1] = sorted[j];
+      j--;
+    }
+    sorted[j + 1] = key;
+  }
+
+  // Drop 2 lowest and 2 highest
+  int drop = 2;
+  long sum = 0;
+  int used = 0;
+  for (int i = drop; i < count - drop; i++) {
+    sum += sorted[i];
+    used++;
+  }
+  return (used > 0) ? (sum / used) : sorted[count / 2];
+}
 
 /**
  * Ensures the NAU7802 internal LDO is powered up and routed to AVDD.
@@ -330,25 +405,42 @@ void performTare() {
   lcd->setCursor(0, 1);
   lcd->print("TARING...       ");
 
-  // Read average of 15 samples
-  long sum = 0;
-  int validSamples = 0;
+  // Read 16 samples using trimmed mean
+  int32_t samples[16];
+  int count = 0;
   unsigned long start = millis();
-  while (validSamples < 15 && (millis() - start < 1500)) {
+  while (count < 16 && (millis() - start < 2000)) {
     int32_t val;
-    if (scale.readRaw(val, 100)) {
-      sum += val;
-      validSamples++;
+    if (scale.readRaw(val, 150)) {
+      samples[count++] = val;
     }
-    delay(10);
+    delay(5);
   }
 
-  if (validSamples > 0) {
-    tareOffset = sum / validSamples;
+  if (count >= 8) {
+    // Sort and average middle samples
+    for (int i = 1; i < count; i++) {
+      int32_t key = samples[i];
+      int j = i - 1;
+      while (j >= 0 && samples[j] > key) {
+        samples[j + 1] = samples[j];
+        j--;
+      }
+      samples[j + 1] = key;
+    }
+    long sum = 0;
+    int used = 0;
+    for (int i = 2; i < count - 2; i++) {
+      sum += samples[i];
+      used++;
+    }
+    tareOffset = sum / used;
     scale.setTareOffset(tareOffset);
     filteredWeight = 0.0f;
+    lockedWeight = 0.0f;
+    isStable = true;
     saveSettings();
-    Serial.printf("[SUCCESS] Tare locked. Offset = %ld (samples: %d)\n", (long)tareOffset, validSamples);
+    Serial.printf("[SUCCESS] Tare locked. Offset = %ld\n", (long)tareOffset);
     lcd->setCursor(0, 1);
     lcd->print("TARE OK!        ");
   } else {
@@ -369,33 +461,51 @@ void calibrateScaleWithWeight(float knownWeight) {
   snprintf(buf, sizeof(buf), "Ref: %.1fg", knownWeight);
   lcd->print(buf);
 
-  // Take average reading with known weight
-  long sum = 0;
-  int validSamples = 0;
+  // Take 20 samples with trimmed mean
+  int32_t samples[20];
+  int count = 0;
   unsigned long start = millis();
-  while (validSamples < 20 && (millis() - start < 2500)) {
+  while (count < 20 && (millis() - start < 2500)) {
     int32_t val;
-    if (scale.readRaw(val, 100)) {
-      sum += val;
-      validSamples++;
+    if (scale.readRaw(val, 150)) {
+      samples[count++] = val;
     }
-    delay(10);
+    delay(5);
   }
 
-  if (validSamples > 0) {
-    int32_t avgVal = sum / validSamples;
+  if (count >= 10) {
+    // Sort and average middle
+    for (int i = 1; i < count; i++) {
+      int32_t key = samples[i];
+      int j = i - 1;
+      while (j >= 0 && samples[j] > key) {
+        samples[j + 1] = samples[j];
+        j--;
+      }
+      samples[j + 1] = key;
+    }
+    long sum = 0;
+    int used = 0;
+    for (int i = 3; i < count - 3; i++) {
+      sum += samples[i];
+      used++;
+    }
+    int32_t avgVal = sum / used;
     int32_t net = avgVal - tareOffset;
     scaleFactor = (float)net / knownWeight;
     isCalibrated = true;
     scale.setScaleFactor(scaleFactor);
+    filteredWeight = knownWeight;
+    lockedWeight = knownWeight;
+    isStable = true;
     saveSettings();
-    Serial.printf("[SUCCESS] Calibration complete! Factor: %.4f counts/g\n", scaleFactor);
+    Serial.printf("[SUCCESS] Calibration complete! Factor: %.4f counts/g (Net: %ld)\n", scaleFactor, (long)net);
 
     lcd->clear();
     lcd->setCursor(0, 0);
     lcd->print("CAL SUCCESS!");
     lcd->setCursor(0, 1);
-    snprintf(buf, sizeof(buf), "F:%.1f c/g", scaleFactor);
+    snprintf(buf, sizeof(buf), "F:%.2f c/g", scaleFactor);
     lcd->print(buf);
   } else {
     Serial.println("[ERROR] Calibration failed. Make sure weight is steady.");
@@ -411,12 +521,12 @@ void calibrateScaleWithWeight(float knownWeight) {
 
 void loadSettings() {
   prefs.begin(PREFS_NAMESPACE, true);
-  scaleFactor = prefs.getFloat("scale_factor", 420.0f);
+  scaleFactor = prefs.getFloat("scale_factor", 88.0f);
   tareOffset = prefs.getInt("tare_offset", 0);
   isCalibrated = prefs.getBool("calibrated", true);
   prefs.end();
 
-  if (scaleFactor == 0.0f) scaleFactor = 420.0f;
+  if (scaleFactor <= 0.0f) scaleFactor = 88.0f;
   scale.setScaleFactor(scaleFactor);
   if (tareOffset != 0) {
     scale.setTareOffset(tareOffset);
@@ -439,7 +549,7 @@ void printHelp() {
   Serial.println();
   Serial.println("--- SERIAL COMMANDS ---");
   Serial.println("  t              : Tare (zero) scale");
-  Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 100')");
+  Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 608')");
   Serial.println("  r              : Read raw ADC and scale diagnostics");
   Serial.println("  h              : Print this help menu");
   Serial.println("-----------------------");

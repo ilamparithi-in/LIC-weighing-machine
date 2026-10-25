@@ -76,8 +76,18 @@ Both the **7Semi NAU7802** and the **16x2 LCD Display (PCF8574 backpack)** share
 ## 4. Compiling & Flashing
 
 Using **Arduino CLI**:
+
+* For the **I2C 16x2 LCD** version:
 ```bash
 arduino-cli compile --fqbn esp32:esp32:nologo_esp32c3_super_mini weighingmachine
 arduino-cli upload -p /dev/ttyACM0 --fqbn esp32:esp32:nologo_esp32c3_super_mini weighingmachine
 ```
-Or open [weighingmachine/weighingmachine.ino](file:///home/ilam_common/DevHome/GitHub/weighingmachine/weighingmachine/weighingmachine.ino) directly in the Arduino IDE, select board **ESP32C3 Dev Module** or **ESP32-C3 SuperMini**, and upload!
+
+* For the **0.91" I2C OLED (SSD1306 128x32)** version:
+```bash
+arduino-cli compile --fqbn esp32:esp32:nologo_esp32c3_super_mini weighingmachine_oled
+arduino-cli upload -p /dev/ttyACM0 --fqbn esp32:esp32:nologo_esp32c3_super_mini weighingmachine_oled
+```
+
+Or open [weighingmachine/weighingmachine.ino](file:///home/ilam_common/DevHome/GitHub/weighingmachine/weighingmachine/weighingmachine.ino) or [weighingmachine_oled/weighingmachine_oled.ino](file:///home/ilam_common/DevHome/GitHub/weighingmachine/weighingmachine_oled/weighingmachine_oled.ino) directly in the Arduino IDE, select board **ESP32C3 Dev Module** or **ESP32-C3 SuperMini**, and upload!
+
