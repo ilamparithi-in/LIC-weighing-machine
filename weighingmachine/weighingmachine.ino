@@ -151,32 +151,11 @@ void setup() {
   // Run internal Analog Front-End (AFE) offset calibration
   calibrateAFE();
 
-  // Load saved calibration and tare offset from flash memory
+  // Load saved calibration scale factor from flash memory
   loadSettings();
 
-  // If no tare offset has ever been saved, perform initial zero
-  if (tareOffset == 0) {
-    performTare();
-  } else {
-    Serial.printf("[INFO] Preserving saved TareOffset = %ld\n", (long)tareOffset);
-  }
-
-  // Pre-fill rolling filter buffer with initial samples
-  Serial.println("[INFO] Stabilizing filter buffer...");
-  int filled = 0;
-  unsigned long startFill = millis();
-  while (filled < FILTER_SIZE && (millis() - startFill < 1500)) {
-    int32_t s = 0;
-    if (scale.readRaw(s, 150)) {
-      adcBuffer[filled++] = s;
-    }
-    delay(5);
-  }
-  bufferIndex = 0;
-  bufferFull = (filled == FILTER_SIZE);
-  latestFilteredADC = getTrimmedMeanADC();
-  filteredWeight = (scaleFactor != 0) ? ((float)(latestFilteredADC - tareOffset) / scaleFactor) : 0.0f;
-  lockedWeight = filteredWeight;
+  // Always tare on startup to zero the empty scale
+  performTare();
 
   lcd->clear();
   printHelp();
