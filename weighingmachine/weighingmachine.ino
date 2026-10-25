@@ -263,9 +263,9 @@ void loop() {
     int32_t netCounts = latestFilteredADC - tareOffset;
     float displayValue = isStable ? lockedWeight : filteredWeight;
 
-    // Line 0: Weight display
+    // Line 0: Weight display (1g integer resolution)
     char lineBuf[17];
-    snprintf(lineBuf, sizeof(lineBuf), "Wt:%7.1fg  %c", displayValue, tick ? '*' : ' ');
+    snprintf(lineBuf, sizeof(lineBuf), "Wt: %5ld g   %c", (long)lround(displayValue), tick ? '*' : ' ');
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
 
@@ -282,10 +282,10 @@ void loop() {
       lcd->print(lineBuf);
     }
 
-    // Serial stream output (never blocks!)
+    // Serial stream output (1g resolution)
     if (Serial.availableForWrite() >= 64) {
-      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld | %s\n", 
-                    displayValue, (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
+      Serial.printf("Weight: %ld g | Raw: %ld | Net: %ld | %s\n", 
+                    (long)lround(displayValue), (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
     }
   }
 }

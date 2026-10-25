@@ -50,8 +50,8 @@ Preferences prefs;
 // ---------------------- CONFIG & CALIBRATION -----------------
 uint8_t oledAddress = 0x3C;      // Typical 0.91" OLED I2C address (0x3C or 0x3D)
 const char* PREFS_NAMESPACE = "scale_cfg";
-float scaleFactor = 9.94f;       // Calibrated counts per gram
-int32_t tareOffset = 75491;      // Empty-scale baseline tare offset
+float scaleFactor = 93.44f;      // Calibrated counts per gram
+int32_t tareOffset = 81628;      // Empty-scale baseline tare offset
 bool isCalibrated = true;
 
 // Debounced button polling variables (immune to USB UART DTR/RTS boot glitches)
@@ -240,7 +240,7 @@ void loop() {
       int32_t netCounts = latestFilteredADC - tareOffset;
       float targetWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
 
-      // Adaptive Smart Filter:
+      // Adaptive Smart Filter (1g integer resolution):
       // - Real load change (> 8.0g): Fast tracking for placing/removing items
       // - Resting load (<= 8.0g): Smooth filtering (6% new sample per frame)
       float delta = abs(targetWeight - filteredWeight);
@@ -253,15 +253,15 @@ void loop() {
         if (stableFrames < 30) stableFrames++;
         if (stableFrames >= 6) {
           isStable = true;
-          // Lock to stable weight with 1.0g hysteresis
-          if (abs(filteredWeight - lockedWeight) > 1.0f) {
-            lockedWeight = round(filteredWeight * 10.0f) / 10.0f;
+          // Lock to stable integer 1g weight with 0.8g hysteresis
+          if (abs(filteredWeight - lockedWeight) >= 0.8f) {
+            lockedWeight = (float)lround(filteredWeight);
           }
         }
       }
 
-      // Snap to 0.0g near zero
-      if (abs(filteredWeight) < 0.4f) {
+      // Snap to 0g near zero (< 0.6g)
+      if (abs(filteredWeight) < 0.6f) {
         filteredWeight = 0.0f;
         lockedWeight = 0.0f;
       }
@@ -281,10 +281,10 @@ void loop() {
 
     drawScaleScreen(displayValue, netCounts, isSaturated, tick, isStable);
 
-    // Serial stream output (never blocks!)
+    // Serial stream output (1g resolution)
     if (Serial.availableForWrite() >= 64) {
-      Serial.printf("Weight: %.2f g | Raw: %ld | Net: %ld | %s\n", 
-                    displayValue, (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
+      Serial.printf("Weight: %ld g | Raw: %ld | Net: %ld | %s\n", 
+                    (long)lround(displayValue), (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
     }
   }
 }
@@ -374,12 +374,9 @@ void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick,
   display.setTextSize(2);
   display.setCursor(0, 0);
 
+  long displayGrams = lround(weight);
   char weightBuf[16];
-  if (abs(weight) >= 10000.0f) {
-    snprintf(weightBuf, sizeof(weightBuf), "%6.1fg", weight);
-  } else {
-    snprintf(weightBuf, sizeof(weightBuf), "%6.1fg", weight);
-  }
+  snprintf(weightBuf, sizeof(weightBuf), "%5ld g", displayGrams);
   display.print(weightBuf);
 
   // Heartbeat indicator icon in top-right corner (128x32 display)
@@ -653,13 +650,13 @@ void calibrateScaleWithWeight(float knownWeight) {
 
 void loadSettings() {
   prefs.begin(PREFS_NAMESPACE, true);
-  scaleFactor = prefs.getFloat("scale_factor", 9.94f);
-  tareOffset = prefs.getInt("tare_offset", 75491);
+  scaleFactor = prefs.getFloat("scale_factor", 93.44f);
+  tareOffset = prefs.getInt("tare_offset", 81628);
   isCalibrated = prefs.getBool("calibrated", true);
   prefs.end();
 
-  if (scaleFactor <= 0.1f) scaleFactor = 9.94f;
-  if (tareOffset == 0 || tareOffset > 80000) tareOffset = 75491;
+  if (scaleFactor <= 0.1f) scaleFactor = 93.44f;
+  if (tareOffset == 0) tareOffset = 81628;
 
   scale.setScaleFactor(scaleFactor);
   scale.setTareOffset(tareOffset);
