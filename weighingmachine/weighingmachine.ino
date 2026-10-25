@@ -59,15 +59,15 @@ void IRAM_ATTR handleTareInterrupt() {
 }
 
 // ---------------------- DIGITAL FILTER CONFIG ----------------
-// Rolling buffer for raw ADC samples
-const int FILTER_SIZE = 12;
+// 8-sample fast rolling buffer for ADC samples (200ms window at 40 SPS)
+const int FILTER_SIZE = 8;
 int32_t adcBuffer[FILTER_SIZE];
 int bufferIndex = 0;
 bool bufferFull = false;
 
 // Display and stability variables
 unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_INTERVAL_MS = 250;  // 4 Hz LCD update rate
+const unsigned long DISPLAY_INTERVAL_MS = 100;  // 10 Hz LCD update rate
 float filteredWeight = 0.0f;
 float lockedWeight = 0.0f;
 bool isStable = false;
@@ -129,8 +129,8 @@ void setup() {
   // Set internal LDO to 3.0V (provides ~300mV headroom below 3.3V VIN for clean regulation)
   scale.setConfig(LDO_3_0V, PGA_128);
 
-  // Set conversion rate to 10 SPS for built-in 50/60Hz notch filter rejection
-  scale.setSampleRate(CRS_10);
+  // Set conversion rate to 40 SPS for fast 25ms response time
+  scale.setSampleRate(CRS_40);
 
   // Nuvoton recommended setting for optimal low-noise operation (0x30 in ADC_CTRL1)
   Wire.beginTransmission(0x2A);
@@ -204,28 +204,28 @@ void loop() {
       int32_t netCounts = latestFilteredADC - tareOffset;
       float targetWeight = (scaleFactor != 0) ? ((float)netCounts / scaleFactor) : 0.0f;
 
-      // Adaptive Smart Filter:
-      // - Real load change (> 2.0g): Fast tracking (50% new sample per frame)
-      // - Resting load (< 2.0g): Smooth filtering (8% new sample per frame)
+      // Multi-tier fast-settling filter (1g integer resolution):
+      // - Step change (> 3.0g): Fast slew tracking (70% new sample per frame)
+      // - Final landing (delta <= 3.0g): Smooth landing (20% new sample per frame)
       float delta = abs(targetWeight - filteredWeight);
-      if (delta > 2.0f) {
-        filteredWeight = (0.50f * targetWeight) + (0.50f * filteredWeight);
+      if (delta > 3.0f) {
+        filteredWeight = (0.70f * targetWeight) + (0.30f * filteredWeight);
         isStable = false;
         stableFrames = 0;
       } else {
-        filteredWeight = (0.08f * targetWeight) + (0.92f * filteredWeight);
-        if (stableFrames < 15) stableFrames++;
+        filteredWeight = (0.20f * targetWeight) + (0.80f * filteredWeight);
+        if (stableFrames < 20) stableFrames++;
         if (stableFrames >= 4) {
           isStable = true;
-          // Lock to stable weight with 0.1g hysteresis
-          if (abs(filteredWeight - lockedWeight) > 0.3f) {
-            lockedWeight = filteredWeight;
+          // Lock to stable integer 1g weight with 0.8g hysteresis
+          if (abs(filteredWeight - lockedWeight) >= 0.8f) {
+            lockedWeight = (float)lround(filteredWeight);
           }
         }
       }
 
-      // Snap to 0.00g near zero
-      if (abs(filteredWeight) < 0.25f) {
+      // Zero-tracking deadband: snap to 0g within +/-1.0g
+      if (abs(filteredWeight) < 1.0f) {
         filteredWeight = 0.0f;
         lockedWeight = 0.0f;
       }
