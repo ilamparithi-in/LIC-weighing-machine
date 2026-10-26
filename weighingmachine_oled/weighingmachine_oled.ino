@@ -541,16 +541,16 @@ void checkBootButton() {
 }
 
 /**
- * Checks external Tare button on D2 (GPIO 2) with 80ms debounce.
+ * Checks external Tare button on D2 (GPIO 2) with instant edge trigger.
  * (GPIO 9 no longer tares).
  */
 void checkTareButton() {
+  static unsigned long lastTareTriggerTime = 0;
   if (digitalRead(TARE_PIN_D2) == LOW) {
-    resetActivityTimer();
-    if (tarePressStartTime == 0) {
-      tarePressStartTime = millis();
-    } else if (millis() - tarePressStartTime > 80 && !tareButtonActive) {
+    if (!tareButtonActive && (millis() - lastTareTriggerTime > 300)) {
       tareButtonActive = true;
+      lastTareTriggerTime = millis();
+      resetActivityTimer();
       if (isHeld) {
         isHeld = false; // Taring clears any active hold
       }
@@ -558,7 +558,6 @@ void checkTareButton() {
       performTare();
     }
   } else {
-    tarePressStartTime = 0;
     tareButtonActive = false;
   }
 }
@@ -606,27 +605,26 @@ void enterSleepMode() {
 }
 
 /**
- * Checks Unit change button (D4 pin GPIO 4) with 80ms debounce.
- * Cycles through g -> kg -> oz -> lb.
+ * Checks Unit change button (D4 pin GPIO 4) with instant edge trigger.
+ * Cycles seamlessly through g -> kg -> oz -> lb.
  */
 void checkUnitButton() {
+  static unsigned long lastUnitTriggerTime = 0;
   if (digitalRead(UNIT_BUTTON_PIN) == LOW) {
-    if (unitPressStartTime == 0) {
-      unitPressStartTime = millis();
-    } else if (millis() - unitPressStartTime > 80 && !unitButtonActive) {
+    if (!unitButtonActive && (millis() - lastUnitTriggerTime > 250)) {
       unitButtonActive = true;
-      Serial.println("[BUTTON] Unit change requested via D4 pin.");
+      lastUnitTriggerTime = millis();
+      resetActivityTimer();
       cycleUnit();
     }
   } else {
-    unitPressStartTime = 0;
     unitButtonActive = false;
   }
 }
 
 /**
  * Cycles to the next weight unit (g -> kg -> oz -> lb -> g)
- * and saves user preference to non-volatile flash.
+ * seamlessly and instantaneously with no screens in between.
  */
 void cycleUnit() {
   currentUnit = (WeightUnit)((currentUnit + 1) % 4);
@@ -636,9 +634,9 @@ void cycleUnit() {
   Serial.printf("[UNIT] Unit changed to: %s (%s)\n", uSym, uName);
   saveSettings();
 
-  char unitLine[20];
-  snprintf(unitLine, sizeof(unitLine), "UNIT: %s", uSym);
-  showStatusScreen(unitLine, uName, 400);
+  // Instant seamless redraw with new unit symbol and converted digits
+  float val = isHeld ? heldWeight : (isStable ? lockedWeight : filteredWeight);
+  drawScaleScreen(val, false);
 }
 
 const char* getUnitSymbol(WeightUnit unit) {

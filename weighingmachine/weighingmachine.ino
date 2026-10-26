@@ -628,16 +628,16 @@ void cycleUnit() {
   Serial.printf("[UNIT] Unit changed to: %s (%s)\n", uSym, uName);
   saveSettings();
 
+  // Instant seamless redraw with new unit symbol on Line 0
   if (lcd) {
-    lcd->clear();
+    float liveValue = isStable ? lockedWeight : filteredWeight;
+    float displayValue = isHeld ? heldWeight : liveValue;
+    char weightBuf[16];
+    formatWeightString(displayValue, currentUnit, weightBuf, sizeof(weightBuf));
+    char lineBuf[17];
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s  %c", weightBuf, isHeld ? 'H' : ' ');
     lcd->setCursor(0, 0);
-    lcd->print("UNIT CHANGED:");
-    lcd->setCursor(0, 1);
-    char uBuf[17];
-    snprintf(uBuf, sizeof(uBuf), "%s (%s)", uSym, uName);
-    lcd->print(uBuf);
-    delay(400);
-    lcd->clear();
+    lcd->print(lineBuf);
   }
 }
 
