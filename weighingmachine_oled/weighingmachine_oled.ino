@@ -370,8 +370,8 @@ void showStatusScreen(const char* line1, const char* line2, uint16_t delayMs) {
 
 /**
  * Renders the full-screen weight interface on the 128x32 OLED display.
- * Pure, high-visibility large numbers centered horizontally & vertically.
- * Flashing dot, raw counts, divider line, and calibration badges are removed.
+ * The measurement unit is fixed on the right side of the display,
+ * and the digits are right-aligned to maintain a stable, non-jumping readout.
  */
 void drawScaleScreen(float weight, bool saturated) {
   display.clearDisplay();
@@ -392,39 +392,35 @@ void drawScaleScreen(float weight, bool saturated) {
   int lenNum = strlen(numStr);
   int lenUnit = strlen(unitStr);
 
-  // In Size 3 font: 15px glyph width + 3px spacing = 18px per character (last char is 15px)
-  // In Size 2 font: 10px glyph width + 2px spacing = 12px per character (last char is 10px)
+  // Unit is fixed on the right side of the display (flush right with 2px margin)
+  int unitW = (lenUnit * 12) - 2;
+  int unitX = 126 - unitW;
+  int unitY = 12; // Size 2 baseline (y=12 to y=28)
+
+  // Digits right-aligned with a 6px gap before the fixed unit
+  int digitsRightX = unitX - 6;
+
+  // Try Size 3 for digits (18px per char, height 24px)
   int wNum3 = (lenNum * 18) - 3;
-  int wUnit2 = (lenUnit * 12) - 2;
-  int spaceW = 5;
-  int totalW = wNum3 + spaceW + wUnit2;
-
-  if (totalW <= 126) {
-    // Fits with giant Size 3 digits (24px height) & Size 2 unit (16px height)
-    int startX = (SCREEN_WIDTH - totalW) / 2;
-    if (startX < 0) startX = 0;
-
+  if (wNum3 <= digitsRightX) {
+    int numX = digitsRightX - wNum3;
     display.setTextSize(3);
-    display.setCursor(startX, 4); // y=4 vertically centers 24px height in 32px screen
+    display.setCursor(numX, 4); // y=4 centers 24px height, baseline at y=28
     display.print(numStr);
-
-    display.setTextSize(2);
-    display.setCursor(startX + wNum3 + spaceW, 12); // y=12 aligns 16px unit with Size 3 digits baseline (4+24 = 12+16 = 28)
-    display.print(unitStr);
   } else {
-    // Fallback for long numbers (>= 10.000 kg, etc.) with Size 2
+    // If number is too wide for Size 3 (e.g. >= 10.000 kg), use Size 2
     int wNum2 = (lenNum * 12) - 2;
-    int totalW2 = wNum2 + spaceW + wUnit2;
-    int startX = (SCREEN_WIDTH - totalW2) / 2;
-    if (startX < 0) startX = 0;
-
+    int numX = digitsRightX - wNum2;
+    if (numX < 0) numX = 0;
     display.setTextSize(2);
-    display.setCursor(startX, 8); // y=8 vertically centers 16px height in 32px screen
+    display.setCursor(numX, 8); // y=8 centers 16px height
     display.print(numStr);
-
-    display.setCursor(startX + wNum2 + spaceW, 8);
-    display.print(unitStr);
   }
+
+  // Draw the fixed unit on the right side
+  display.setTextSize(2);
+  display.setCursor(unitX, unitY);
+  display.print(unitStr);
 
   display.display();
 }
