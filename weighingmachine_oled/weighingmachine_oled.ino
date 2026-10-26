@@ -179,8 +179,6 @@ void setup() {
   // Auto-detect and initialize 0.91" OLED (0x3C or 0x3D)
   if (!scanAndInitOLED()) {
     Serial.println("[ERROR] OLED Display initialization failed! Check wiring.");
-  } else {
-    showStatusScreen("ESP32-C3 Scale", "Init NAU7802...", 500);
   }
 
   // Initialize 7Semi NAU7802
@@ -817,22 +815,33 @@ void calibrateAFE() {
 
 void performTare() {
   Serial.println("[ACTION] Performing Tare (Zeroing)...");
-  showStatusScreen("TARING...", "Keep plate empty");
 
-  // Read 20 samples and use trimmed mean for exact zero
-  const int TARE_SAMPLES = 20;
+  // Initial weight before zeroing
+  float startWeight = filteredWeight;
+
+  // Read 14 samples and use trimmed mean for exact zero.
+  // During sampling, rapidly animate the raw weight value down to 0 on the main screen.
+  const int TARE_SAMPLES = 14;
   int32_t samples[TARE_SAMPLES];
   int validSamples = 0;
   unsigned long start = millis();
-  while (validSamples < TARE_SAMPLES && (millis() - start < 2500)) {
+
+  while (validSamples < TARE_SAMPLES && (millis() - start < 1500)) {
     int32_t val;
-    if (scale.readRaw(val, 120)) {
+    if (scale.readRaw(val, 80)) {
       samples[validSamples++] = val;
+
+      // Rapidly fall down to 0 with quadratic deceleration curve
+      float progress = (float)validSamples / (float)TARE_SAMPLES;
+      float remain = 1.0f - progress;
+      float animWeight = startWeight * remain * remain;
+
+      drawScaleScreen(animWeight, false);
     }
-    delay(10);
+    delay(5);
   }
 
-  if (validSamples >= 10) {
+  if (validSamples >= 8) {
     // Sort samples
     for (int i = 1; i < validSamples; i++) {
       int32_t key = samples[i];
@@ -870,13 +879,11 @@ void performTare() {
 
     saveSettings();
     Serial.printf("[SUCCESS] Tare locked. Offset = %ld (samples: %d)\n", (long)tareOffset, validSamples);
-    
-    char offsetBuf[22];
-    snprintf(offsetBuf, sizeof(offsetBuf), "Offset: %ld", (long)tareOffset);
-    showStatusScreen("TARE OK!", offsetBuf, 400);
+
+    // Final clean 0 display
+    drawScaleScreen(0.0f, false);
   } else {
     Serial.println("[ERROR] Tare failed! ADC timeout.");
-    showStatusScreen("TARE ERROR!", "ADC Timeout", 800);
   }
 }
 

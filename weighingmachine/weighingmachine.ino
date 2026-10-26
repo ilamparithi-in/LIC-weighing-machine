@@ -172,10 +172,6 @@ void setup() {
   lcd->init();
   lcd->backlight();
   lcd->clear();
-  lcd->setCursor(0, 0);
-  lcd->print("ESP32-C3 Scale");
-  lcd->setCursor(0, 1);
-  lcd->print("Init NAU7802...");
 
   // Initialize 7Semi NAU7802
   Serial.println("[INFO] Initializing NAU7802 ADC...");
@@ -490,17 +486,31 @@ void scanAndInitI2C() {
 
 void performTare() {
   Serial.println("[ACTION] Performing Tare (Zeroing)...");
-  lcd->setCursor(0, 1);
-  lcd->print("TARING...       ");
 
-  // Read 16 samples using trimmed mean
-  int32_t samples[16];
+  float startWeight = filteredWeight;
+
+  // Read 14 samples using trimmed mean.
+  // During sampling, rapidly animate the raw weight value down to 0 on Line 0 of the LCD.
+  const int TARE_SAMPLES = 14;
+  int32_t samples[TARE_SAMPLES];
   int count = 0;
   unsigned long start = millis();
-  while (count < 16 && (millis() - start < 2000)) {
+
+  while (count < TARE_SAMPLES && (millis() - start < 1500)) {
     int32_t val;
-    if (scale.readRaw(val, 150)) {
+    if (scale.readRaw(val, 80)) {
       samples[count++] = val;
+
+      float progress = (float)count / (float)TARE_SAMPLES;
+      float remain = 1.0f - progress;
+      float animWeight = startWeight * remain * remain;
+
+      char weightBuf[16];
+      formatWeightString(animWeight, currentUnit, weightBuf, sizeof(weightBuf));
+      char lineBuf[17];
+      snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s   ", weightBuf);
+      lcd->setCursor(0, 0);
+      lcd->print(lineBuf);
     }
     delay(5);
   }
@@ -529,14 +539,17 @@ void performTare() {
     isStable = true;
     saveSettings();
     Serial.printf("[SUCCESS] Tare locked. Offset = %ld\n", (long)tareOffset);
-    lcd->setCursor(0, 1);
-    lcd->print("TARE OK!        ");
+
+    // Final clean 0 display
+    char weightBuf[16];
+    formatWeightString(0.0f, currentUnit, weightBuf, sizeof(weightBuf));
+    char lineBuf[17];
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s   ", weightBuf);
+    lcd->setCursor(0, 0);
+    lcd->print(lineBuf);
   } else {
     Serial.println("[ERROR] Tare failed! ADC timeout.");
-    lcd->setCursor(0, 1);
-    lcd->print("TARE ERROR!     ");
   }
-  delay(300);
 }
 
 void calibrateScaleWithWeight(float knownWeight) {
