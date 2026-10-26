@@ -33,18 +33,7 @@
 #define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
-
-// Auxiliary Digital Input Pins (All available header GPIOs)
-#define PIN_D0             0     // D0 (GPIO 0, active LOW / pull to GND)
-#define PIN_D1             1     // D1 (GPIO 1, active LOW / pull to GND)
-#define PIN_D2             2     // D2 (GPIO 2, active LOW / pull to GND)
-#define PIN_D3             3     // D3 (GPIO 3, active LOW / pull to GND)
-#define PIN_D4             4     // D4 (GPIO 4, active LOW / pull to GND)
-#define PIN_D5             5     // D5 (GPIO 5, active LOW / pull to GND)
-#define PIN_D8             8     // D8 (GPIO 8, active LOW / pull to GND)
-#define PIN_D10            10    // D10 (GPIO 10, active LOW / pull to GND)
-#define PIN_RX             20    // RX (GPIO 20, active LOW / pull to GND)
-#define PIN_TX             21    // TX (GPIO 21, active LOW / pull to GND)
+#define TARE_PIN_D2        2     // External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
 
 // ---------------------- OBJECTS & STORAGE --------------------
 NAU7802_7Semi scale(Wire);
@@ -70,30 +59,7 @@ void IRAM_ATTR handleTareInterrupt() {
   }
 }
 
-// ---------------------- AUX DIGITAL PINS --------------------
-struct AuxButton {
-  uint8_t pin;
-  const char* name;
-  bool isPressed;
-  unsigned long pressStart;
-};
 
-AuxButton auxButtons[] = {
-  {PIN_D0,  "D0",  false, 0},
-  {PIN_D1,  "D1",  false, 0},
-  {PIN_D2,  "D2",  false, 0},
-  {PIN_D3,  "D3",  false, 0},
-  {PIN_D4,  "D4",  false, 0},
-  {PIN_D5,  "D5",  false, 0},
-  {PIN_D8,  "D8",  false, 0},
-  {PIN_D10, "D10", false, 0},
-  {PIN_RX,  "RX",  false, 0},
-  {PIN_TX,  "TX",  false, 0}
-};
-const int NUM_AUX_BUTTONS = sizeof(auxButtons) / sizeof(auxButtons[0]);
-
-char activeButtonsStr[32] = "";
-unsigned long buttonBannerUntil = 0;
 
 // ---------------------- DIGITAL FILTER CONFIG ----------------
 // 8-sample fast rolling buffer for ADC samples (200ms window at 40 SPS)
@@ -117,7 +83,6 @@ void enableInternalLDO();
 void calibrateAFE();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
-void checkAuxButtons();
 void loadSettings();
 void saveSettings();
 void printHelp();
@@ -133,14 +98,11 @@ void setup() {
   Serial.println(" ESP32-C3 SuperMini + NAU7802 + I2C LCD Scale ");
   Serial.println("===============================================");
 
-  // Initialize BOOT button as Tare with Hardware Interrupt
+  // Initialize BOOT button and D2 as Tare inputs with internal pullups
   pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TARE_BUTTON_PIN), handleTareInterrupt, FALLING);
-
-  // Initialize all auxiliary digital pin inputs with internal pullups
-  for (int i = 0; i < NUM_AUX_BUTTONS; i++) {
-    pinMode(auxButtons[i].pin, INPUT_PULLUP);
-  }
+  pinMode(TARE_PIN_D2, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(TARE_PIN_D2), handleTareInterrupt, FALLING);
 
   // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -205,12 +167,11 @@ void setup() {
 }
 
 void loop() {
-  // 1. Check Tare request & Aux buttons (D0, D1, D2)
+  // 1. Check Tare request (from physical BOOT button or D2 pin)
   if (tareRequested) {
     tareRequested = false;
     performTare();
   }
-  checkAuxButtons();
 
   // 2. Check Serial Commands
   if (Serial.available()) {
@@ -292,14 +253,10 @@ void loop() {
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
 
-    // Line 1: Status & Net ADC counts or Button Press
+    // Line 1: Status & Net ADC counts
     lcd->setCursor(0, 1);
     if (latestFilteredADC <= -8388600 || latestFilteredADC >= 8388600) {
       lcd->print("ADC SATURATED!  ");
-    } else if (millis() < buttonBannerUntil) {
-      char btnBuf[17];
-      snprintf(btnBuf, sizeof(btnBuf), "BTN: %-11s", activeButtonsStr);
-      lcd->print(btnBuf);
     } else {
       if (isStable) {
         snprintf(lineBuf, sizeof(lineBuf), "STABLE  %6ld", (long)netCounts);
@@ -318,47 +275,6 @@ void loop() {
 }
 
 // ---------------------- HELPER FUNCTIONS ---------------------
-
-/**
- * Monitors all auxiliary digital pins (pulled to GND when pressed).
- * Debounces with 30ms window and activates on-screen indicator.
- */
-void checkAuxButtons() {
-  bool anyHeld = false;
-  char currentPressed[32] = "";
-
-  for (int i = 0; i < NUM_AUX_BUTTONS; i++) {
-    bool rawLow = (digitalRead(auxButtons[i].pin) == LOW);
-    if (rawLow) {
-      if (!auxButtons[i].isPressed) {
-        if (auxButtons[i].pressStart == 0) {
-          auxButtons[i].pressStart = millis();
-        } else if (millis() - auxButtons[i].pressStart >= 30) {
-          auxButtons[i].isPressed = true;
-          buttonBannerUntil = millis() + 1500;
-          Serial.printf("[PIN_EVENT] %s Pulled to GND!\n", auxButtons[i].name);
-        }
-      }
-    } else {
-      if (auxButtons[i].isPressed) {
-        auxButtons[i].isPressed = false;
-        Serial.printf("[PIN_EVENT] %s Released (HIGH).\n", auxButtons[i].name);
-      }
-      auxButtons[i].pressStart = 0;
-    }
-
-    if (auxButtons[i].isPressed || (rawLow && auxButtons[i].pressStart != 0)) {
-      anyHeld = true;
-      if (strlen(currentPressed) > 0) strcat(currentPressed, " ");
-      strcat(currentPressed, auxButtons[i].name);
-    }
-  }
-
-  if (anyHeld) {
-    strncpy(activeButtonsStr, currentPressed, sizeof(activeButtonsStr) - 1);
-    buttonBannerUntil = millis() + 1500;
-  }
-}
 
 /**
  * Calculates a trimmed-mean ADC value from the rolling buffer:

@@ -36,18 +36,7 @@
 #define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
-
-// Auxiliary Digital Input Pins (All available header GPIOs)
-#define PIN_D0             0     // D0 (GPIO 0, active LOW / pull to GND)
-#define PIN_D1             1     // D1 (GPIO 1, active LOW / pull to GND)
-#define PIN_D2             2     // D2 (GPIO 2, active LOW / pull to GND)
-#define PIN_D3             3     // D3 (GPIO 3, active LOW / pull to GND)
-#define PIN_D4             4     // D4 (GPIO 4, active LOW / pull to GND)
-#define PIN_D5             5     // D5 (GPIO 5, active LOW / pull to GND)
-#define PIN_D8             8     // D8 (GPIO 8, active LOW / pull to GND)
-#define PIN_D10            10    // D10 (GPIO 10, active LOW / pull to GND)
-#define PIN_RX             20    // RX (GPIO 20, active LOW / pull to GND)
-#define PIN_TX             21    // TX (GPIO 21, active LOW / pull to GND)
+#define TARE_PIN_D2        2     // External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
 
 // ---------------------- OLED DISPLAY CONFIG ------------------
 #define SCREEN_WIDTH     128     // OLED display width in pixels
@@ -66,34 +55,9 @@ float scaleFactor = 93.44f;      // Calibrated counts per gram
 int32_t tareOffset = 81628;      // Empty-scale baseline tare offset
 bool isCalibrated = true;
 
-// Debounced tare button polling variables (BOOT pin GPIO 9)
+// Debounced tare button polling variables (D2 pin & BOOT pin GPIO 9)
 unsigned long buttonPressStartTime = 0;
 bool buttonActive = false;
-
-// ---------------------- AUX DIGITAL PINS --------------------
-struct AuxButton {
-  uint8_t pin;
-  const char* name;
-  bool isPressed;
-  unsigned long pressStart;
-};
-
-AuxButton auxButtons[] = {
-  {PIN_D0,  "D0",  false, 0},
-  {PIN_D1,  "D1",  false, 0},
-  {PIN_D2,  "D2",  false, 0},
-  {PIN_D3,  "D3",  false, 0},
-  {PIN_D4,  "D4",  false, 0},
-  {PIN_D5,  "D5",  false, 0},
-  {PIN_D8,  "D8",  false, 0},
-  {PIN_D10, "D10", false, 0},
-  {PIN_RX,  "RX",  false, 0},
-  {PIN_TX,  "TX",  false, 0}
-};
-const int NUM_AUX_BUTTONS = sizeof(auxButtons) / sizeof(auxButtons[0]);
-
-char activeButtonsStr[32] = "";
-unsigned long buttonBannerUntil = 0;
 
 // ---------------------- DIGITAL FILTER CONFIG ----------------
 // 8-sample fast rolling buffer for ADC samples (200ms window at 40 SPS)
@@ -120,7 +84,6 @@ void calibrateAFE();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
 void checkTareButton();
-void checkAuxButtons();
 void loadSettings();
 void saveSettings();
 void printHelp();
@@ -154,13 +117,9 @@ void setup() {
   Serial.println(" ESP32-C3 SuperMini + NAU7802 + 0.91\" OLED Scale   ");
   Serial.println("====================================================");
 
-  // Initialize BOOT button as Tare with internal pullup
+  // Initialize BOOT button and D2 as Tare inputs with internal pullups
   pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
-
-  // Initialize all auxiliary digital pin inputs with internal pullups
-  for (int i = 0; i < NUM_AUX_BUTTONS; i++) {
-    pinMode(auxButtons[i].pin, INPUT_PULLUP);
-  }
+  pinMode(TARE_PIN_D2, INPUT_PULLUP);
 
   // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -217,9 +176,8 @@ void setup() {
 }
 
 void loop() {
-  // 1. Debounced Button polling (Tare BOOT button + D0, D1, D2 buttons)
+  // 1. Debounced Tare button polling (D2 pin & on-board BOOT button)
   checkTareButton();
-  checkAuxButtons();
 
   // 2. Check Serial Commands (if serial port has data)
   if (Serial.available()) {
@@ -424,21 +382,6 @@ void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick,
 
   if (saturated) {
     display.print("! ADC SATURATED !");
-  } else if (millis() < buttonBannerUntil) {
-    // High-contrast inverted highlight banner when any digital pin is grounded
-    display.fillRect(0, 19, 128, 13, SSD1306_WHITE);
-    display.setTextColor(SSD1306_BLACK);
-    display.setCursor(2, 22);
-    char btnBuf[26];
-    snprintf(btnBuf, sizeof(btnBuf), ">> PIN %s PRESSED <<", activeButtonsStr);
-    if (strlen(btnBuf) > 21) {
-      snprintf(btnBuf, sizeof(btnBuf), ">> PIN %s <<", activeButtonsStr);
-      if (strlen(btnBuf) > 21) {
-        snprintf(btnBuf, sizeof(btnBuf), "PIN: %s", activeButtonsStr);
-      }
-    }
-    display.print(btnBuf);
-    display.setTextColor(SSD1306_WHITE);
   } else {
     char subBuf[24];
     if (stable) {
@@ -455,61 +398,21 @@ void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick,
 // ---------------------- HELPER FUNCTIONS ---------------------
 
 /**
- * Checks physical BOOT button (GPIO 9) with 120ms debounce.
+ * Checks Tare buttons (D2 pin & physical BOOT button GPIO 9) with 80ms debounce.
  */
 void checkTareButton() {
-  if (digitalRead(TARE_BUTTON_PIN) == LOW) {
+  bool isTareLow = (digitalRead(TARE_BUTTON_PIN) == LOW) || (digitalRead(TARE_PIN_D2) == LOW);
+  if (isTareLow) {
     if (buttonPressStartTime == 0) {
       buttonPressStartTime = millis();
-    } else if (millis() - buttonPressStartTime > 120 && !buttonActive) {
+    } else if (millis() - buttonPressStartTime > 80 && !buttonActive) {
       buttonActive = true;
-      Serial.println("[BUTTON] BOOT button pressed. Performing Tare...");
+      Serial.println("[BUTTON] Tare requested via D2 / BOOT button. Performing Tare...");
       performTare();
     }
   } else {
     buttonPressStartTime = 0;
     buttonActive = false;
-  }
-}
-
-/**
- * Monitors all auxiliary digital pins (pulled to GND when pressed).
- * Debounces with 30ms window and activates on-screen indicator.
- */
-void checkAuxButtons() {
-  bool anyHeld = false;
-  char currentPressed[32] = "";
-
-  for (int i = 0; i < NUM_AUX_BUTTONS; i++) {
-    bool rawLow = (digitalRead(auxButtons[i].pin) == LOW);
-    if (rawLow) {
-      if (!auxButtons[i].isPressed) {
-        if (auxButtons[i].pressStart == 0) {
-          auxButtons[i].pressStart = millis();
-        } else if (millis() - auxButtons[i].pressStart >= 30) {
-          auxButtons[i].isPressed = true;
-          buttonBannerUntil = millis() + 1500;
-          Serial.printf("[PIN_EVENT] %s Pulled to GND!\n", auxButtons[i].name);
-        }
-      }
-    } else {
-      if (auxButtons[i].isPressed) {
-        auxButtons[i].isPressed = false;
-        Serial.printf("[PIN_EVENT] %s Released (HIGH).\n", auxButtons[i].name);
-      }
-      auxButtons[i].pressStart = 0;
-    }
-
-    if (auxButtons[i].isPressed || (rawLow && auxButtons[i].pressStart != 0)) {
-      anyHeld = true;
-      if (strlen(currentPressed) > 0) strcat(currentPressed, " ");
-      strcat(currentPressed, auxButtons[i].name);
-    }
-  }
-
-  if (anyHeld) {
-    strncpy(activeButtonsStr, currentPressed, sizeof(activeButtonsStr) - 1);
-    buttonBannerUntil = millis() + 1500; // Stay active while held + 1.5s holdover
   }
 }
 
