@@ -11,8 +11,15 @@
  * GND                     GND                    GND
  * GPIO 6 (SDA)            SDA                    SDA
  * GPIO 7 (SCL)            SCL                    SCL
- * 
- * Note: The onboard BOOT button (GPIO 9) is used as the TARE button!
+ *
+ * Button Configuration:
+ * - On-board BOOT Button (GPIO 9) :
+ *     * Single Click : Toggle Weight HOLD on/off
+ *     * Hold 3 Seconds: Power Off (Ultra-low power sleep)
+ *     * Press while Off: Wake up / Power on
+ *     * (Note: GPIO 9 NO LONGER tares the scale)
+ * - External D2 Pin (GPIO 2)     : Dedicated TARE (Zero) button (pull to GND)
+ * - External D4 Pin (GPIO 4)     : Dedicated UNIT cycle button (g -> kg -> oz -> lb)
  *
  * Load Cell (Standard 4-Wire) to 7Semi NAU7802:
  * --------------------------------------------------------------------
@@ -28,12 +35,13 @@
 #include <LiquidCrystal_I2C.h>
 #include <7Semi_NAU7802.h>
 #include <Preferences.h>
+#include "esp_sleep.h"
 
 // ---------------------- PIN DEFINITIONS ----------------------
 #define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
-#define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
-#define TARE_PIN_D2        2     // External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
+#define BOOT_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 (active LOW: Click=HOLD, Hold 3s=SLEEP)
+#define TARE_PIN_D2        2     // Dedicated External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
 #define UNIT_BUTTON_PIN    4     // External Unit Button on D4 (GPIO 4, active LOW / pull to GND)
 
 // ---------------------- UNITS OF MEASURE --------------------
@@ -57,11 +65,24 @@ float scaleFactor = 88.0f;       // Calibrated counts per gram
 int32_t tareOffset = 0;
 bool isCalibrated = true;
 
-// Tare and Unit button interrupt flags
+// Dedicated D2 Tare button interrupt flag
 volatile bool tareRequested = false;
 volatile unsigned long lastTareInterruptTime = 0;
+
+// D4 Unit button interrupt flag
 volatile bool unitChangeRequested = false;
 volatile unsigned long lastUnitInterruptTime = 0;
+
+// BOOT button (GPIO 9) polling variables: Click=HOLD, Hold 3s=SLEEP
+unsigned long bootPressStartTime = 0;
+bool bootShutdownTriggered = false;
+bool isHeld = false;
+float heldWeight = 0.0f;
+
+// Auto-Shutdown inactivity variables (2 minutes)
+unsigned long lastActivityTime = 0;
+float lastActivityWeight = 0.0f;
+const unsigned long AUTO_SHUTDOWN_TIMEOUT_MS = 120000;
 
 void IRAM_ATTR handleTareInterrupt() {
   unsigned long now = millis();
@@ -103,6 +124,9 @@ void enableInternalLDO();
 void calibrateAFE();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
+void checkBootButton();
+void enterSleepMode();
+void resetActivityTimer();
 void cycleUnit();
 void formatWeightString(float grams, WeightUnit unit, char* outBuf, size_t maxLen);
 const char* getUnitSymbol(WeightUnit unit);
@@ -122,15 +146,20 @@ void setup() {
   Serial.println(" ESP32-C3 SuperMini + NAU7802 + I2C LCD Scale ");
   Serial.println("===============================================");
 
-  // Initialize BOOT button and D2 as Tare inputs with internal pullups
-  pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(TARE_BUTTON_PIN), handleTareInterrupt, FALLING);
+  // Initialize BOOT button (GPIO 9), D2 Tare, and D4 Unit pins with internal pullups
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
   pinMode(TARE_PIN_D2, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TARE_PIN_D2), handleTareInterrupt, FALLING);
 
   // Initialize D4 as Unit Change button input with internal pullup
   pinMode(UNIT_BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(UNIT_BUTTON_PIN), handleUnitInterrupt, FALLING);
+
+  // If woken from sleep while BOOT button is still held, wait for release
+  while (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+    delay(10);
+  }
+  delay(50);
 
   // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -190,29 +219,54 @@ void setup() {
   // Always tare on startup to zero the empty scale
   performTare();
 
+  resetActivityTimer();
+  lastActivityWeight = 0.0f;
+
   lcd->clear();
   printHelp();
 }
 
 void loop() {
-  // 1. Check Button requests (Tare from BOOT/D2, Unit change from D4)
+  // 1. Check Button requests
+  checkBootButton();  // GPIO 9: Click=HOLD, Hold 3s=SLEEP
   if (tareRequested) {
     tareRequested = false;
+    resetActivityTimer();
+    if (isHeld) isHeld = false;
     performTare();
   }
   if (unitChangeRequested) {
     unitChangeRequested = false;
+    resetActivityTimer();
     cycleUnit();
   }
 
-  // 2. Check Serial Commands
+  // 2. Auto-Shutdown check (2 minutes of inactivity)
+  if (!isHeld && (millis() - lastActivityTime >= AUTO_SHUTDOWN_TIMEOUT_MS)) {
+    Serial.println("[AUTO-OFF] 2 minutes of inactivity reached. Entering sleep mode...");
+    enterSleepMode();
+  }
+
+  // 3. Check Serial Commands
   if (Serial.available()) {
     String cmd = Serial.readStringUntil('\n');
     cmd.trim();
+    resetActivityTimer();
+
     if (cmd.equalsIgnoreCase("t") || cmd.equalsIgnoreCase("tare")) {
       performTare();
     } else if (cmd.equalsIgnoreCase("u") || cmd.equalsIgnoreCase("unit")) {
       cycleUnit();
+    } else if (cmd.equalsIgnoreCase("hold")) {
+      isHeld = !isHeld;
+      if (isHeld) {
+        heldWeight = isStable ? lockedWeight : filteredWeight;
+        Serial.printf("[HOLD] Weight held at: %.1f g\n", heldWeight);
+      } else {
+        Serial.println("[HOLD] Weight released.");
+      }
+    } else if (cmd.equalsIgnoreCase("off") || cmd.equalsIgnoreCase("sleep")) {
+      enterSleepMode();
     } else if (cmd.startsWith("c ") || cmd.startsWith("cal ")) {
       int spaceIdx = cmd.indexOf(' ');
       float weight = cmd.substring(spaceIdx + 1).toFloat();
@@ -230,7 +284,7 @@ void loop() {
     }
   }
 
-  // 3. Continuously acquire ADC samples into rolling ring buffer
+  // 4. Continuously acquire ADC samples into rolling ring buffer
   if (scale.available()) {
     int32_t val = 0;
     if (scale.readRaw(val, 5)) {
@@ -268,10 +322,16 @@ void loop() {
         filteredWeight = 0.0f;
         lockedWeight = 0.0f;
       }
+
+      // Reset auto-shutdown inactivity timer on significant weight change (>= 2.0g)
+      if (abs(filteredWeight - lastActivityWeight) >= 2.0f) {
+        lastActivityWeight = filteredWeight;
+        resetActivityTimer();
+      }
     }
   }
 
-  // 4. Refresh LCD at exact 250ms intervals
+  // 5. Refresh LCD at exact 100ms intervals
   if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
     lastDisplayUpdate = millis();
 
@@ -279,13 +339,14 @@ void loop() {
     tick = !tick;
 
     int32_t netCounts = latestFilteredADC - tareOffset;
-    float displayValue = isStable ? lockedWeight : filteredWeight;
+    float liveValue = isStable ? lockedWeight : filteredWeight;
+    float displayValue = isHeld ? heldWeight : liveValue;
 
     // Line 0: Weight display
     char weightBuf[16];
     formatWeightString(displayValue, currentUnit, weightBuf, sizeof(weightBuf));
     char lineBuf[17];
-    snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s  %c", weightBuf, tick ? '*' : ' ');
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s  %c", weightBuf, isHeld ? 'H' : (tick ? '*' : ' '));
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
 
@@ -294,7 +355,9 @@ void loop() {
     if (latestFilteredADC <= -8388600 || latestFilteredADC >= 8388600) {
       lcd->print("ADC SATURATED!  ");
     } else {
-      if (isStable) {
+      if (isHeld) {
+        snprintf(lineBuf, sizeof(lineBuf), "HOLD    %6ld", (long)netCounts);
+      } else if (isStable) {
         snprintf(lineBuf, sizeof(lineBuf), "STABLE  %6ld", (long)netCounts);
       } else {
         snprintf(lineBuf, sizeof(lineBuf), "Net:    %6ld", (long)netCounts);
@@ -306,8 +369,10 @@ void loop() {
     if (Serial.availableForWrite() >= 64) {
       char serWeightBuf[20];
       formatWeightString(displayValue, currentUnit, serWeightBuf, sizeof(serWeightBuf));
-      Serial.printf("Weight: %s | Raw: %ld | Net: %ld | %s\n", 
-                    serWeightBuf, (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
+      Serial.printf("Weight: %s | Raw: %ld | Net: %ld | %s%s\n", 
+                    serWeightBuf, (long)latestFilteredADC, (long)netCounts, 
+                    isHeld ? "[HOLD] " : "",
+                    isStable ? "[STABLE]" : "[MOVING]");
     }
   }
 }
@@ -647,11 +712,96 @@ void saveSettings() {
   Serial.println("[CONFIG] Saved settings to Non-Volatile Flash.");
 }
 
+void resetActivityTimer() {
+  lastActivityTime = millis();
+}
+
+/**
+ * Checks physical BOOT button (GPIO 9):
+ * - Short press (< 2000ms): Toggles weight HOLD on display
+ * - Long press (>= 3000ms): Enters ultra-low power Sleep Mode
+ */
+void checkBootButton() {
+  if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+    resetActivityTimer();
+    if (bootPressStartTime == 0) {
+      bootPressStartTime = millis();
+      bootShutdownTriggered = false;
+    } else {
+      unsigned long holdMs = millis() - bootPressStartTime;
+      if (holdMs >= 3000 && !bootShutdownTriggered) {
+        bootShutdownTriggered = true;
+        enterSleepMode();
+      }
+    }
+  } else {
+    if (bootPressStartTime > 0) {
+      unsigned long pressDuration = millis() - bootPressStartTime;
+      bootPressStartTime = 0;
+      if (!bootShutdownTriggered && pressDuration >= 80 && pressDuration < 2500) {
+        isHeld = !isHeld;
+        if (isHeld) {
+          heldWeight = isStable ? lockedWeight : filteredWeight;
+          Serial.printf("[HOLD] Weight held at: %.1f g\n", heldWeight);
+        } else {
+          Serial.println("[HOLD] Weight unheld (live stream resumed).");
+        }
+      }
+      bootShutdownTriggered = false;
+    }
+  }
+}
+
+/**
+ * Powers off LCD & NAU7802, and enters low power Sleep (~0.13mA) with GPIO 9 wakeup.
+ */
+void enterSleepMode() {
+  Serial.println("[POWER] Entering low power sleep mode...");
+  if (lcd) {
+    lcd->clear();
+    lcd->setCursor(0, 0);
+    lcd->print("POWER OFF");
+    lcd->setCursor(0, 1);
+    lcd->print("Goodbye!");
+    delay(800);
+    lcd->noBacklight();
+    lcd->noDisplay();
+  }
+
+  // Power down NAU7802 internal LDO & ADC
+  Wire.beginTransmission(0x2A);
+  Wire.write(0x00);
+  Wire.write(0x00);
+  Wire.endTransmission();
+
+  // Configure GPIO 9 as wake-up source
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  Serial.flush();
+  delay(100);
+
+  // Enter light sleep
+  esp_light_sleep_start();
+
+  // Wait for release (with 1500ms safety timeout)
+  unsigned long wakeWaitStart = millis();
+  while (digitalRead(BOOT_BUTTON_PIN) == LOW && (millis() - wakeWaitStart < 1500)) {
+    delay(10);
+  }
+  delay(50);
+
+  esp_restart();
+}
+
 void printHelp() {
   Serial.println();
   Serial.println("--- SERIAL COMMANDS ---");
   Serial.println("  t              : Tare (zero) scale");
   Serial.println("  u              : Cycle unit (g -> kg -> oz -> lb)");
+  Serial.println("  hold           : Toggle weight HOLD freeze");
+  Serial.println("  off / sleep    : Enter ultra-low power sleep");
   Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 608')");
   Serial.println("  r              : Read raw ADC and scale diagnostics");
   Serial.println("  h              : Print this help menu");
