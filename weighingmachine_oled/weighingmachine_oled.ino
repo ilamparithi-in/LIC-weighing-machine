@@ -92,7 +92,7 @@ int32_t latestFilteredADC = 0;
 // ---------------------- FORWARD DECLARATIONS -----------------
 bool scanAndInitOLED();
 void showStatusScreen(const char* line1, const char* line2 = nullptr, uint16_t delayMs = 0);
-void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick, bool stable);
+void drawScaleScreen(float weight, bool saturated = false);
 void enableInternalLDO();
 void calibrateAFE();
 void performTare();
@@ -101,6 +101,7 @@ void checkTareButton();
 void checkUnitButton();
 void cycleUnit();
 void formatWeightString(float grams, WeightUnit unit, char* outBuf, size_t maxLen);
+void formatWeightNumber(float grams, WeightUnit unit, char* outBuf, size_t maxLen);
 const char* getUnitSymbol(WeightUnit unit);
 const char* getUnitName(WeightUnit unit);
 void loadSettings();
@@ -284,14 +285,11 @@ void loop() {
   if (millis() - lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
     lastDisplayUpdate = millis();
 
-    static bool tick = false;
-    tick = !tick;
-
     int32_t netCounts = latestFilteredADC - tareOffset;
     bool isSaturated = (latestFilteredADC <= -8388600 || latestFilteredADC >= 8388600);
     float displayValue = isStable ? lockedWeight : filteredWeight;
 
-    drawScaleScreen(displayValue, netCounts, isSaturated, tick, isStable);
+    drawScaleScreen(displayValue, isSaturated);
 
     // Serial stream output formatted with current active unit
     if (Serial.availableForWrite() >= 64) {
@@ -371,51 +369,61 @@ void showStatusScreen(const char* line1, const char* line2, uint16_t delayMs) {
 }
 
 /**
- * Renders the main weighing scale interface on the 128x32 OLED display.
- * 
- * Layout:
- * +-----------------------------------------------+
- * |  608.0 g                                  [*] |  <- Size 2 Weight + Heartbeat dot
- * |-----------------------------------------------|  <- Horizontal rule
- * | STABLE  6043c                             [C] |  <- Size 1 Status, Net counts & Calibrated badge
- * +-----------------------------------------------+
+ * Renders the full-screen weight interface on the 128x32 OLED display.
+ * Pure, high-visibility large numbers centered horizontally & vertically.
+ * Flashing dot, raw counts, divider line, and calibration badges are removed.
  */
-void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick, bool stable) {
+void drawScaleScreen(float weight, bool saturated) {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  // Line 1: Weight in large Size 2 font (12x16 pixels per char)
-  display.setTextSize(2);
-  display.setCursor(0, 0);
-
-  char weightBuf[20];
-  formatWeightString(weight, currentUnit, weightBuf, sizeof(weightBuf));
-  display.print(weightBuf);
-
-  // Heartbeat indicator icon in top-right corner (128x32 display)
-  if (tick) {
-    display.fillCircle(123, 6, 2, SSD1306_WHITE);
-  } else {
-    display.drawCircle(123, 6, 2, SSD1306_WHITE);
+  if (saturated) {
+    display.setTextSize(2);
+    display.setCursor(4, 8);
+    display.print("! OVERLOAD !");
+    display.display();
+    return;
   }
 
-  // Divider line
-  display.drawFastHLine(0, 18, 128, SSD1306_WHITE);
+  char numStr[16];
+  formatWeightNumber(weight, currentUnit, numStr, sizeof(numStr));
+  const char* unitStr = getUnitSymbol(currentUnit);
 
-  // Line 2: Status line in Size 1 font (6x8 pixels per char)
-  display.setTextSize(1);
-  display.setCursor(0, 22);
+  int lenNum = strlen(numStr);
+  int lenUnit = strlen(unitStr);
 
-  if (saturated) {
-    display.print("! ADC SATURATED !");
+  // In Size 3 font: 15px glyph width + 3px spacing = 18px per character (last char is 15px)
+  // In Size 2 font: 10px glyph width + 2px spacing = 12px per character (last char is 10px)
+  int wNum3 = (lenNum * 18) - 3;
+  int wUnit2 = (lenUnit * 12) - 2;
+  int spaceW = 5;
+  int totalW = wNum3 + spaceW + wUnit2;
+
+  if (totalW <= 126) {
+    // Fits with giant Size 3 digits (24px height) & Size 2 unit (16px height)
+    int startX = (SCREEN_WIDTH - totalW) / 2;
+    if (startX < 0) startX = 0;
+
+    display.setTextSize(3);
+    display.setCursor(startX, 4); // y=4 vertically centers 24px height in 32px screen
+    display.print(numStr);
+
+    display.setTextSize(2);
+    display.setCursor(startX + wNum3 + spaceW, 12); // y=12 aligns 16px unit with Size 3 digits baseline (4+24 = 12+16 = 28)
+    display.print(unitStr);
   } else {
-    char subBuf[24];
-    if (stable) {
-      snprintf(subBuf, sizeof(subBuf), "STABLE %5ldc   [%c]", (long)netCounts, isCalibrated ? 'C' : 'U');
-    } else {
-      snprintf(subBuf, sizeof(subBuf), "Net:   %5ldc   [%c]", (long)netCounts, isCalibrated ? 'C' : 'U');
-    }
-    display.print(subBuf);
+    // Fallback for long numbers (>= 10.000 kg, etc.) with Size 2
+    int wNum2 = (lenNum * 12) - 2;
+    int totalW2 = wNum2 + spaceW + wUnit2;
+    int startX = (SCREEN_WIDTH - totalW2) / 2;
+    if (startX < 0) startX = 0;
+
+    display.setTextSize(2);
+    display.setCursor(startX, 8); // y=8 vertically centers 16px height in 32px screen
+    display.print(numStr);
+
+    display.setCursor(startX + wNum2 + spaceW, 8);
+    display.print(unitStr);
   }
 
   display.display();
@@ -529,6 +537,38 @@ void formatWeightString(float grams, WeightUnit unit, char* outBuf, size_t maxLe
     default: {
       long g = lround(grams);
       snprintf(outBuf, maxLen, "%5ld g", g);
+      break;
+    }
+  }
+}
+
+/**
+ * Formats just the numeric weight value without unit or leading padding.
+ */
+void formatWeightNumber(float grams, WeightUnit unit, char* outBuf, size_t maxLen) {
+  switch (unit) {
+    case UNIT_KG: {
+      float kg = grams / 1000.0f;
+      if (abs(kg) < 0.0005f) kg = 0.0f;
+      snprintf(outBuf, maxLen, "%.3f", kg);
+      break;
+    }
+    case UNIT_OZ: {
+      float oz = grams / 28.349523f;
+      if (abs(oz) < 0.005f) oz = 0.0f;
+      snprintf(outBuf, maxLen, "%.2f", oz);
+      break;
+    }
+    case UNIT_LB: {
+      float lb = grams / 453.59237f;
+      if (abs(lb) < 0.0005f) lb = 0.0f;
+      snprintf(outBuf, maxLen, "%.3f", lb);
+      break;
+    }
+    case UNIT_G:
+    default: {
+      long g = lround(grams);
+      snprintf(outBuf, maxLen, "%ld", g);
       break;
     }
   }
