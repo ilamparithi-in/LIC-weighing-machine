@@ -36,9 +36,18 @@
 #define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
-#define PIN_D0             0     // D0 Button (GPIO 0, active LOW / pull to GND)
-#define PIN_D1             1     // D1 Button (GPIO 1, active LOW / pull to GND)
-#define PIN_D2             2     // D2 Button (GPIO 2, active LOW / pull to GND)
+
+// Auxiliary Digital Input Pins (All available header GPIOs)
+#define PIN_D0             0     // D0 (GPIO 0, active LOW / pull to GND)
+#define PIN_D1             1     // D1 (GPIO 1, active LOW / pull to GND)
+#define PIN_D2             2     // D2 (GPIO 2, active LOW / pull to GND)
+#define PIN_D3             3     // D3 (GPIO 3, active LOW / pull to GND)
+#define PIN_D4             4     // D4 (GPIO 4, active LOW / pull to GND)
+#define PIN_D5             5     // D5 (GPIO 5, active LOW / pull to GND)
+#define PIN_D8             8     // D8 (GPIO 8, active LOW / pull to GND)
+#define PIN_D10            10    // D10 (GPIO 10, active LOW / pull to GND)
+#define PIN_RX             20    // RX (GPIO 20, active LOW / pull to GND)
+#define PIN_TX             21    // TX (GPIO 21, active LOW / pull to GND)
 
 // ---------------------- OLED DISPLAY CONFIG ------------------
 #define SCREEN_WIDTH     128     // OLED display width in pixels
@@ -61,7 +70,7 @@ bool isCalibrated = true;
 unsigned long buttonPressStartTime = 0;
 bool buttonActive = false;
 
-// ---------------------- AUX BUTTONS (D0, D1, D2) -------------
+// ---------------------- AUX DIGITAL PINS --------------------
 struct AuxButton {
   uint8_t pin;
   const char* name;
@@ -70,12 +79,20 @@ struct AuxButton {
 };
 
 AuxButton auxButtons[] = {
-  {PIN_D0, "D0", false, 0},
-  {PIN_D1, "D1", false, 0},
-  {PIN_D2, "D2", false, 0}
+  {PIN_D0,  "D0",  false, 0},
+  {PIN_D1,  "D1",  false, 0},
+  {PIN_D2,  "D2",  false, 0},
+  {PIN_D3,  "D3",  false, 0},
+  {PIN_D4,  "D4",  false, 0},
+  {PIN_D5,  "D5",  false, 0},
+  {PIN_D8,  "D8",  false, 0},
+  {PIN_D10, "D10", false, 0},
+  {PIN_RX,  "RX",  false, 0},
+  {PIN_TX,  "TX",  false, 0}
 };
+const int NUM_AUX_BUTTONS = sizeof(auxButtons) / sizeof(auxButtons[0]);
 
-char activeButtonsStr[20] = "";
+char activeButtonsStr[32] = "";
 unsigned long buttonBannerUntil = 0;
 
 // ---------------------- DIGITAL FILTER CONFIG ----------------
@@ -140,10 +157,10 @@ void setup() {
   // Initialize BOOT button as Tare with internal pullup
   pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
 
-  // Initialize D0, D1, D2 auxiliary button inputs with internal pullups
-  pinMode(PIN_D0, INPUT_PULLUP);
-  pinMode(PIN_D1, INPUT_PULLUP);
-  pinMode(PIN_D2, INPUT_PULLUP);
+  // Initialize all auxiliary digital pin inputs with internal pullups
+  for (int i = 0; i < NUM_AUX_BUTTONS; i++) {
+    pinMode(auxButtons[i].pin, INPUT_PULLUP);
+  }
 
   // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -408,14 +425,17 @@ void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick,
   if (saturated) {
     display.print("! ADC SATURATED !");
   } else if (millis() < buttonBannerUntil) {
-    // High-contrast inverted highlight banner when D0, D1, or D2 is grounded
+    // High-contrast inverted highlight banner when any digital pin is grounded
     display.fillRect(0, 19, 128, 13, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
-    display.setCursor(4, 22);
-    char btnBuf[24];
-    snprintf(btnBuf, sizeof(btnBuf), ">> BTN %s PRESSED <<", activeButtonsStr);
+    display.setCursor(2, 22);
+    char btnBuf[26];
+    snprintf(btnBuf, sizeof(btnBuf), ">> PIN %s PRESSED <<", activeButtonsStr);
     if (strlen(btnBuf) > 21) {
-      snprintf(btnBuf, sizeof(btnBuf), ">> BTN %s <<", activeButtonsStr);
+      snprintf(btnBuf, sizeof(btnBuf), ">> PIN %s <<", activeButtonsStr);
+      if (strlen(btnBuf) > 21) {
+        snprintf(btnBuf, sizeof(btnBuf), "PIN: %s", activeButtonsStr);
+      }
     }
     display.print(btnBuf);
     display.setTextColor(SSD1306_WHITE);
@@ -453,14 +473,14 @@ void checkTareButton() {
 }
 
 /**
- * Monitors D0, D1, D2 buttons (pulled to GND when pressed).
+ * Monitors all auxiliary digital pins (pulled to GND when pressed).
  * Debounces with 30ms window and activates on-screen indicator.
  */
 void checkAuxButtons() {
   bool anyHeld = false;
-  char currentPressed[20] = "";
+  char currentPressed[32] = "";
 
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < NUM_AUX_BUTTONS; i++) {
     bool rawLow = (digitalRead(auxButtons[i].pin) == LOW);
     if (rawLow) {
       if (!auxButtons[i].isPressed) {
@@ -469,13 +489,13 @@ void checkAuxButtons() {
         } else if (millis() - auxButtons[i].pressStart >= 30) {
           auxButtons[i].isPressed = true;
           buttonBannerUntil = millis() + 1500;
-          Serial.printf("[BUTTON] %s Pressed (GND)!\n", auxButtons[i].name);
+          Serial.printf("[PIN_EVENT] %s Pulled to GND!\n", auxButtons[i].name);
         }
       }
     } else {
       if (auxButtons[i].isPressed) {
         auxButtons[i].isPressed = false;
-        Serial.printf("[BUTTON] %s Released.\n", auxButtons[i].name);
+        Serial.printf("[PIN_EVENT] %s Released (HIGH).\n", auxButtons[i].name);
       }
       auxButtons[i].pressStart = 0;
     }
