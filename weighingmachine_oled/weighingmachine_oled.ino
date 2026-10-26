@@ -37,6 +37,16 @@
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
 #define TARE_PIN_D2        2     // External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
+#define UNIT_BUTTON_PIN    4     // External Unit Change Button on D4 (GPIO 4, active LOW / pull to GND)
+
+// ---------------------- UNITS OF MEASURE --------------------
+enum WeightUnit {
+  UNIT_G = 0,                    // Grams (e.g., 607 g)
+  UNIT_KG = 1,                   // Kilograms (e.g., 0.607 kg)
+  UNIT_OZ = 2,                   // Ounces (e.g., 21.41 oz)
+  UNIT_LB = 3                    // Pounds (e.g., 1.338 lb)
+};
+WeightUnit currentUnit = UNIT_G;
 
 // ---------------------- OLED DISPLAY CONFIG ------------------
 #define SCREEN_WIDTH     128     // OLED display width in pixels
@@ -58,6 +68,10 @@ bool isCalibrated = true;
 // Debounced tare button polling variables (D2 pin & BOOT pin GPIO 9)
 unsigned long buttonPressStartTime = 0;
 bool buttonActive = false;
+
+// Debounced unit change button polling variables (D4 pin GPIO 4)
+unsigned long unitPressStartTime = 0;
+bool unitButtonActive = false;
 
 // ---------------------- DIGITAL FILTER CONFIG ----------------
 // 8-sample fast rolling buffer for ADC samples (200ms window at 40 SPS)
@@ -84,6 +98,11 @@ void calibrateAFE();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
 void checkTareButton();
+void checkUnitButton();
+void cycleUnit();
+void formatWeightString(float grams, WeightUnit unit, char* outBuf, size_t maxLen);
+const char* getUnitSymbol(WeightUnit unit);
+const char* getUnitName(WeightUnit unit);
 void loadSettings();
 void saveSettings();
 void printHelp();
@@ -120,6 +139,9 @@ void setup() {
   // Initialize BOOT button and D2 as Tare inputs with internal pullups
   pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
   pinMode(TARE_PIN_D2, INPUT_PULLUP);
+
+  // Initialize D4 as Unit Change button input with internal pullup
+  pinMode(UNIT_BUTTON_PIN, INPUT_PULLUP);
 
   // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -176,8 +198,9 @@ void setup() {
 }
 
 void loop() {
-  // 1. Debounced Tare button polling (D2 pin & on-board BOOT button)
+  // 1. Debounced Button polling (Tare BOOT/D2 buttons & D4 Unit button)
   checkTareButton();
+  checkUnitButton();
 
   // 2. Check Serial Commands (if serial port has data)
   if (Serial.available()) {
@@ -185,6 +208,8 @@ void loop() {
     cmd.trim();
     if (cmd.equalsIgnoreCase("t") || cmd.equalsIgnoreCase("tare")) {
       performTare();
+    } else if (cmd.equalsIgnoreCase("u") || cmd.equalsIgnoreCase("unit")) {
+      cycleUnit();
     } else if (cmd.startsWith("c ") || cmd.startsWith("cal ")) {
       int spaceIdx = cmd.indexOf(' ');
       float weight = cmd.substring(spaceIdx + 1).toFloat();
@@ -268,10 +293,12 @@ void loop() {
 
     drawScaleScreen(displayValue, netCounts, isSaturated, tick, isStable);
 
-    // Serial stream output (1g resolution)
+    // Serial stream output formatted with current active unit
     if (Serial.availableForWrite() >= 64) {
-      Serial.printf("Weight: %ld g | Raw: %ld | Net: %ld | %s\n", 
-                    (long)lround(displayValue), (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
+      char serWeightBuf[20];
+      formatWeightString(displayValue, currentUnit, serWeightBuf, sizeof(serWeightBuf));
+      Serial.printf("Weight: %s | Raw: %ld | Net: %ld | %s\n", 
+                    serWeightBuf, (long)latestFilteredADC, (long)netCounts, isStable ? "[STABLE]" : "[MOVING]");
     }
   }
 }
@@ -361,9 +388,8 @@ void drawScaleScreen(float weight, int32_t netCounts, bool saturated, bool tick,
   display.setTextSize(2);
   display.setCursor(0, 0);
 
-  long displayGrams = lround(weight);
-  char weightBuf[16];
-  snprintf(weightBuf, sizeof(weightBuf), "%5ld g", displayGrams);
+  char weightBuf[20];
+  formatWeightString(weight, currentUnit, weightBuf, sizeof(weightBuf));
   display.print(weightBuf);
 
   // Heartbeat indicator icon in top-right corner (128x32 display)
@@ -413,6 +439,98 @@ void checkTareButton() {
   } else {
     buttonPressStartTime = 0;
     buttonActive = false;
+  }
+}
+
+/**
+ * Checks Unit change button (D4 pin GPIO 4) with 80ms debounce.
+ * Cycles through g -> kg -> oz -> lb.
+ */
+void checkUnitButton() {
+  if (digitalRead(UNIT_BUTTON_PIN) == LOW) {
+    if (unitPressStartTime == 0) {
+      unitPressStartTime = millis();
+    } else if (millis() - unitPressStartTime > 80 && !unitButtonActive) {
+      unitButtonActive = true;
+      Serial.println("[BUTTON] Unit change requested via D4 pin.");
+      cycleUnit();
+    }
+  } else {
+    unitPressStartTime = 0;
+    unitButtonActive = false;
+  }
+}
+
+/**
+ * Cycles to the next weight unit (g -> kg -> oz -> lb -> g)
+ * and saves user preference to non-volatile flash.
+ */
+void cycleUnit() {
+  currentUnit = (WeightUnit)((currentUnit + 1) % 4);
+  const char* uSym = getUnitSymbol(currentUnit);
+  const char* uName = getUnitName(currentUnit);
+
+  Serial.printf("[UNIT] Unit changed to: %s (%s)\n", uSym, uName);
+  saveSettings();
+
+  char unitLine[20];
+  snprintf(unitLine, sizeof(unitLine), "UNIT: %s", uSym);
+  showStatusScreen(unitLine, uName, 400);
+}
+
+const char* getUnitSymbol(WeightUnit unit) {
+  switch (unit) {
+    case UNIT_KG: return "kg";
+    case UNIT_OZ: return "oz";
+    case UNIT_LB: return "lb";
+    case UNIT_G:
+    default:      return "g";
+  }
+}
+
+const char* getUnitName(WeightUnit unit) {
+  switch (unit) {
+    case UNIT_KG: return "Kilograms";
+    case UNIT_OZ: return "Ounces";
+    case UNIT_LB: return "Pounds";
+    case UNIT_G:
+    default:      return "Grams";
+  }
+}
+
+/**
+ * Formats weight value into string according to current unit:
+ * - g:  integer resolution (e.g., "  607 g")
+ * - kg: 3 decimals for 1g resolution (e.g., "0.607 kg")
+ * - oz: 2 decimals for ~0.035 oz resolution (e.g., "21.41 oz")
+ * - lb: 3 decimals for ~0.0022 lb resolution (e.g., "1.338 lb")
+ */
+void formatWeightString(float grams, WeightUnit unit, char* outBuf, size_t maxLen) {
+  switch (unit) {
+    case UNIT_KG: {
+      float kg = grams / 1000.0f;
+      if (abs(kg) < 0.0005f) kg = 0.0f;
+      snprintf(outBuf, maxLen, "%.3f kg", kg);
+      break;
+    }
+    case UNIT_OZ: {
+      float oz = grams / 28.349523f;
+      if (abs(oz) < 0.005f) oz = 0.0f;
+      snprintf(outBuf, maxLen, "%.2f oz", oz);
+      break;
+    }
+    case UNIT_LB: {
+      float lb = grams / 453.59237f;
+      if (abs(lb) < 0.0005f) lb = 0.0f;
+      snprintf(outBuf, maxLen, "%.3f lb", lb);
+      break;
+    }
+    case UNIT_G:
+    default: {
+      long g = lround(grams);
+      snprintf(outBuf, maxLen, "%5ld g", g);
+      break;
+    }
   }
 }
 
@@ -641,16 +759,18 @@ void loadSettings() {
   scaleFactor = prefs.getFloat("scale_factor", 93.44f);
   tareOffset = prefs.getInt("tare_offset", 81628);
   isCalibrated = prefs.getBool("calibrated", true);
+  currentUnit = (WeightUnit)prefs.getUChar("unit", (uint8_t)UNIT_G);
   prefs.end();
 
   if (scaleFactor <= 0.1f) scaleFactor = 93.44f;
   if (tareOffset == 0) tareOffset = 81628;
+  if (currentUnit > UNIT_LB) currentUnit = UNIT_G;
 
   scale.setScaleFactor(scaleFactor);
   scale.setTareOffset(tareOffset);
 
-  Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Calibrated: %s\n",
-                scaleFactor, (long)tareOffset, isCalibrated ? "YES" : "NO");
+  Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Unit: %s | Calibrated: %s\n",
+                scaleFactor, (long)tareOffset, getUnitSymbol(currentUnit), isCalibrated ? "YES" : "NO");
 }
 
 void saveSettings() {
@@ -658,6 +778,7 @@ void saveSettings() {
   prefs.putFloat("scale_factor", scaleFactor);
   prefs.putInt("tare_offset", tareOffset);
   prefs.putBool("calibrated", isCalibrated);
+  prefs.putUChar("unit", (uint8_t)currentUnit);
   prefs.end();
   Serial.println("[CONFIG] Saved settings to Non-Volatile Flash.");
 }
@@ -666,6 +787,7 @@ void printHelp() {
   Serial.println();
   Serial.println("--- SERIAL COMMANDS ---");
   Serial.println("  t              : Tare (zero) scale");
+  Serial.println("  u              : Cycle unit (g -> kg -> oz -> lb)");
   Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 608')");
   Serial.println("  offset <val>   : Manually set tare offset (e.g., 'offset 75491')");
   Serial.println("  factor <val>   : Manually set scale factor (e.g., 'factor 9.94')");
