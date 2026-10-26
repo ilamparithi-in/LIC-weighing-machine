@@ -14,7 +14,7 @@
  * Button Configuration:
  * - On-board BOOT Button (GPIO 9) :
  *     * Single Click : Toggle Weight HOLD on/off
- *     * Hold 3 Seconds: Power Off (Ultra-low power sleep)
+ *     * Hold 1.5 Seconds: Power Off (Ultra-low power sleep)
  *     * Press while Off: Wake up / Power on
  *     * (Note: GPIO 9 NO LONGER tares the scale)
  * - External D2 Pin (GPIO 2)     : Dedicated TARE (Zero) button (pull to GND)
@@ -43,7 +43,7 @@
 // ---------------------- PIN DEFINITIONS ----------------------
 #define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
-#define BOOT_BUTTON_PIN    9     // On-board BOOT Button (GPIO 9, active LOW: Click=HOLD, Hold 3s=SLEEP/WAKE)
+#define BOOT_BUTTON_PIN    9     // On-board BOOT Button (GPIO 9, active LOW: Click=HOLD, Hold 1.5s=SLEEP/WAKE)
 #define TARE_PIN_D2        2     // Dedicated External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
 #define UNIT_BUTTON_PIN    4     // External Unit Change Button on D4 (GPIO 4, active LOW / pull to GND)
 
@@ -81,9 +81,10 @@ bool tareButtonActive = false;
 unsigned long unitPressStartTime = 0;
 bool unitButtonActive = false;
 
-// BOOT button (GPIO 9) polling variables: Click = HOLD / UNHOLD, Hold 3s = SLEEP / POWER OFF
+// BOOT button (GPIO 9) polling variables: Click = HOLD / UNHOLD, Hold 1.5s = SLEEP / POWER OFF
 unsigned long bootPressStartTime = 0;
 bool bootShutdownTriggered = false;
+const unsigned long BOOT_SLEEP_HOLD_MS = 1500;  // 1.5 seconds hold for power off/sleep
 bool isHeld = false;
 float heldWeight = 0.0f;
 
@@ -501,8 +502,8 @@ void resetActivityTimer() {
 
 /**
  * Checks physical BOOT button (GPIO 9):
- * - Short press (< 2000ms): Toggles weight HOLD on display
- * - Long press (>= 3000ms): Enters ultra-low power Sleep Mode
+ * - Short press (< 1500ms): Toggles weight HOLD on display
+ * - Long press (>= 1500ms): Enters ultra-low power Sleep Mode
  */
 void checkBootButton() {
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
@@ -512,12 +513,12 @@ void checkBootButton() {
       bootShutdownTriggered = false;
     } else {
       unsigned long holdMs = millis() - bootPressStartTime;
-      // Show visual shutdown countdown indicator while holding between 1.5s and 3s
-      if (holdMs >= 1500 && holdMs < 3000) {
+      // Show visual shutdown countdown indicator while holding between 700ms and 1500ms
+      if (holdMs >= 700 && holdMs < BOOT_SLEEP_HOLD_MS) {
         // Visual indicator that shutdown is engaging
         display.fillRect(0, 0, 128, 4, SSD1306_WHITE);
         display.display();
-      } else if (holdMs >= 3000 && !bootShutdownTriggered) {
+      } else if (holdMs >= BOOT_SLEEP_HOLD_MS && !bootShutdownTriggered) {
         bootShutdownTriggered = true;
         enterSleepMode();
       }
@@ -527,7 +528,7 @@ void checkBootButton() {
     if (bootPressStartTime > 0) {
       unsigned long pressDuration = millis() - bootPressStartTime;
       bootPressStartTime = 0;
-      if (!bootShutdownTriggered && pressDuration >= 80 && pressDuration < 2500) {
+      if (!bootShutdownTriggered && pressDuration >= 80 && pressDuration < BOOT_SLEEP_HOLD_MS) {
         isHeld = !isHeld;
         if (isHeld) {
           heldWeight = isStable ? lockedWeight : filteredWeight;

@@ -73,9 +73,10 @@ volatile unsigned long lastTareInterruptTime = 0;
 volatile bool unitChangeRequested = false;
 volatile unsigned long lastUnitInterruptTime = 0;
 
-// BOOT button (GPIO 9) polling variables: Click=HOLD, Hold 3s=SLEEP
+// BOOT button (GPIO 9) polling variables: Click=HOLD, Hold 1.5s=SLEEP
 unsigned long bootPressStartTime = 0;
 bool bootShutdownTriggered = false;
+const unsigned long BOOT_SLEEP_HOLD_MS = 1500;  // 1.5 seconds hold for power off/sleep
 bool isHeld = false;
 float heldWeight = 0.0f;
 
@@ -718,8 +719,8 @@ void resetActivityTimer() {
 
 /**
  * Checks physical BOOT button (GPIO 9):
- * - Short press (< 2000ms): Toggles weight HOLD on display
- * - Long press (>= 3000ms): Enters ultra-low power Sleep Mode
+ * - Short press (< 1500ms): Toggles weight HOLD on display
+ * - Long press (>= 1500ms): Enters ultra-low power Sleep Mode
  */
 void checkBootButton() {
   if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
@@ -729,7 +730,7 @@ void checkBootButton() {
       bootShutdownTriggered = false;
     } else {
       unsigned long holdMs = millis() - bootPressStartTime;
-      if (holdMs >= 3000 && !bootShutdownTriggered) {
+      if (holdMs >= BOOT_SLEEP_HOLD_MS && !bootShutdownTriggered) {
         bootShutdownTriggered = true;
         enterSleepMode();
       }
@@ -738,7 +739,7 @@ void checkBootButton() {
     if (bootPressStartTime > 0) {
       unsigned long pressDuration = millis() - bootPressStartTime;
       bootPressStartTime = 0;
-      if (!bootShutdownTriggered && pressDuration >= 80 && pressDuration < 2500) {
+      if (!bootShutdownTriggered && pressDuration >= 80 && pressDuration < BOOT_SLEEP_HOLD_MS) {
         isHeld = !isHeld;
         if (isHeld) {
           heldWeight = isStable ? lockedWeight : filteredWeight;

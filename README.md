@@ -17,7 +17,7 @@ Both the **7Semi NAU7802** and the **16x2 LCD Display (PCF8574 backpack)** share
 | **GND** | **GND** | **GND** | Common Ground |
 | **GPIO 4** | **SDA** | **SDA** | I2C Data line |
 | **GPIO 5** | **SCL** | **SCL** | I2C Clock line |
-| **GPIO 9 (BOOT Button)**| - | - | **Power / HOLD Button**:<br>- 1-Click: HOLD/UNHOLD weight<br>- Hold 3s: Power Off (Sleep)<br>- Press: Power On (Wake) |
+| **GPIO 9 (BOOT Button)**| - | - | **Power / HOLD Button**:<br>- 1-Click: HOLD/UNHOLD weight<br>- Hold 1.5s: Power Off (Sleep)<br>- Press: Power On (Wake) |
 | **GPIO 2 (D2 Pin)**     | - | - | **Dedicated TARE Button** (Pull to GND) |
 | **GPIO 4 (D4 Pin)**     | - | - | **Dedicated UNIT Button** (Cycle g/kg/oz/lb) |
 
