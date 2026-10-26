@@ -33,6 +33,9 @@
 #define I2C_SDA_PIN        6     // I2C SDA (GPIO 6)
 #define I2C_SCL_PIN        7     // I2C SCL (GPIO 7)
 #define TARE_BUTTON_PIN    9     // On-board BOOT Button on ESP32-C3 SuperMini (active LOW)
+#define PIN_D0             0     // D0 Button (GPIO 0, active LOW / pull to GND)
+#define PIN_D1             1     // D1 Button (GPIO 1, active LOW / pull to GND)
+#define PIN_D2             2     // D2 Button (GPIO 2, active LOW / pull to GND)
 
 // ---------------------- OBJECTS & STORAGE --------------------
 NAU7802_7Semi scale(Wire);
@@ -58,6 +61,23 @@ void IRAM_ATTR handleTareInterrupt() {
   }
 }
 
+// ---------------------- AUX BUTTONS (D0, D1, D2) -------------
+struct AuxButton {
+  uint8_t pin;
+  const char* name;
+  bool isPressed;
+  unsigned long pressStart;
+};
+
+AuxButton auxButtons[] = {
+  {PIN_D0, "D0", false, 0},
+  {PIN_D1, "D1", false, 0},
+  {PIN_D2, "D2", false, 0}
+};
+
+char activeButtonsStr[20] = "";
+unsigned long buttonBannerUntil = 0;
+
 // ---------------------- DIGITAL FILTER CONFIG ----------------
 // 8-sample fast rolling buffer for ADC samples (200ms window at 40 SPS)
 const int FILTER_SIZE = 8;
@@ -80,6 +100,7 @@ void enableInternalLDO();
 void calibrateAFE();
 void performTare();
 void calibrateScaleWithWeight(float knownWeight);
+void checkAuxButtons();
 void loadSettings();
 void saveSettings();
 void printHelp();
@@ -98,6 +119,11 @@ void setup() {
   // Initialize BOOT button as Tare with Hardware Interrupt
   pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(TARE_BUTTON_PIN), handleTareInterrupt, FALLING);
+
+  // Initialize D0, D1, D2 auxiliary button inputs with internal pullups
+  pinMode(PIN_D0, INPUT_PULLUP);
+  pinMode(PIN_D1, INPUT_PULLUP);
+  pinMode(PIN_D2, INPUT_PULLUP);
 
   // Initialize I2C Bus on GPIO 6 & 7
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -162,11 +188,12 @@ void setup() {
 }
 
 void loop() {
-  // 1. Check Tare request (from physical BOOT button interrupt or Serial)
+  // 1. Check Tare request & Aux buttons (D0, D1, D2)
   if (tareRequested) {
     tareRequested = false;
     performTare();
   }
+  checkAuxButtons();
 
   // 2. Check Serial Commands
   if (Serial.available()) {
@@ -248,10 +275,14 @@ void loop() {
     lcd->setCursor(0, 0);
     lcd->print(lineBuf);
 
-    // Line 1: Status & Net ADC counts
+    // Line 1: Status & Net ADC counts or Button Press
     lcd->setCursor(0, 1);
     if (latestFilteredADC <= -8388600 || latestFilteredADC >= 8388600) {
       lcd->print("ADC SATURATED!  ");
+    } else if (millis() < buttonBannerUntil) {
+      char btnBuf[17];
+      snprintf(btnBuf, sizeof(btnBuf), "BTN: %-11s", activeButtonsStr);
+      lcd->print(btnBuf);
     } else {
       if (isStable) {
         snprintf(lineBuf, sizeof(lineBuf), "STABLE  %6ld", (long)netCounts);
@@ -270,6 +301,47 @@ void loop() {
 }
 
 // ---------------------- HELPER FUNCTIONS ---------------------
+
+/**
+ * Monitors D0, D1, D2 buttons (pulled to GND when pressed).
+ * Debounces with 30ms window and activates on-screen indicator.
+ */
+void checkAuxButtons() {
+  bool anyHeld = false;
+  char currentPressed[20] = "";
+
+  for (int i = 0; i < 3; i++) {
+    bool rawLow = (digitalRead(auxButtons[i].pin) == LOW);
+    if (rawLow) {
+      if (!auxButtons[i].isPressed) {
+        if (auxButtons[i].pressStart == 0) {
+          auxButtons[i].pressStart = millis();
+        } else if (millis() - auxButtons[i].pressStart >= 30) {
+          auxButtons[i].isPressed = true;
+          buttonBannerUntil = millis() + 1500;
+          Serial.printf("[BUTTON] %s Pressed (GND)!\n", auxButtons[i].name);
+        }
+      }
+    } else {
+      if (auxButtons[i].isPressed) {
+        auxButtons[i].isPressed = false;
+        Serial.printf("[BUTTON] %s Released.\n", auxButtons[i].name);
+      }
+      auxButtons[i].pressStart = 0;
+    }
+
+    if (auxButtons[i].isPressed || (rawLow && auxButtons[i].pressStart != 0)) {
+      anyHeld = true;
+      if (strlen(currentPressed) > 0) strcat(currentPressed, " ");
+      strcat(currentPressed, auxButtons[i].name);
+    }
+  }
+
+  if (anyHeld) {
+    strncpy(activeButtonsStr, currentPressed, sizeof(activeButtonsStr) - 1);
+    buttonBannerUntil = millis() + 1500;
+  }
+}
 
 /**
  * Calculates a trimmed-mean ADC value from the rolling buffer:
