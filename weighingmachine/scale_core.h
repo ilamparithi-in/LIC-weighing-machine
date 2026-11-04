@@ -57,6 +57,10 @@ private:
   unsigned long _lastUnitTriggerTime;
   bool _unitButtonActive;
 
+  // Power Bank Keep-Alive (IP5306)
+  unsigned long _lastPowerPulseTime;
+  bool _isPowerPulsing;
+
 public:
   ScaleCore(ScaleDisplay* display)
     : _display(display),
@@ -82,7 +86,9 @@ public:
       _lastTareTriggerTime(0),
       _tareButtonActive(false),
       _lastUnitTriggerTime(0),
-      _unitButtonActive(false) {
+      _unitButtonActive(false),
+      _lastPowerPulseTime(0),
+      _isPowerPulsing(false) {
     for (int i = 0; i < FILTER_SIZE; i++) {
       _adcBuffer[i] = 0;
     }
@@ -102,6 +108,15 @@ public:
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
     pinMode(TARE_PIN_D2, INPUT_PULLUP);
     pinMode(UNIT_BUTTON_PIN, INPUT_PULLUP);
+
+#ifdef POWER_BANK_PULSE_PIN
+    // 3b. Configure Power Bank keep-alive pulse pin (default high-Z input)
+    pinMode(POWER_BANK_PULSE_PIN, INPUT);
+    _lastPowerPulseTime = millis();
+    _isPowerPulsing = false;
+    Serial.printf("[INFO] Power Bank keep-alive active on GPIO %d (pulsing every %lu ms)\n",
+                  POWER_BANK_PULSE_PIN, (unsigned long)POWER_BANK_PULSE_INTERVAL_MS);
+#endif
 
     // If woken from sleep while BOOT button is held, wait for release
     unsigned long releaseStart = millis();
@@ -176,6 +191,9 @@ public:
     checkBootButton();
     checkTareButton();
     checkUnitButton();
+
+    // 1b. Power bank keep-alive pulse (IP5306)
+    updatePowerBankPulse();
 
     // 2. Auto-Shutdown on 2 minutes inactivity
     if (!_isHeld && (millis() - _lastActivityTime >= AUTO_SHUTDOWN_TIMEOUT_MS)) {
@@ -617,6 +635,27 @@ public:
   }
 
 private:
+  void updatePowerBankPulse() {
+#ifdef POWER_BANK_PULSE_PIN
+    unsigned long now = millis();
+    if (!_isPowerPulsing) {
+      if (now - _lastPowerPulseTime >= POWER_BANK_PULSE_INTERVAL_MS) {
+        _isPowerPulsing = true;
+        _lastPowerPulseTime = now;
+        // Start pulse: pull to ground
+        digitalWrite(POWER_BANK_PULSE_PIN, LOW);
+        pinMode(POWER_BANK_PULSE_PIN, OUTPUT);
+      }
+    } else {
+      if (now - _lastPowerPulseTime >= POWER_BANK_PULSE_DURATION_MS) {
+        _isPowerPulsing = false;
+        // End pulse: release back to high-impedance
+        pinMode(POWER_BANK_PULSE_PIN, INPUT);
+      }
+    }
+#endif
+  }
+
   void enableInternalLDO() {
     Wire.beginTransmission(NAU7802_I2C_ADDR);
     Wire.write(0x00); // REG_PU_CTRL
