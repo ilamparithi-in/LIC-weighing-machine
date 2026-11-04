@@ -16,11 +16,11 @@
 #endif
 
 // ---------------------- PIN DEFINITIONS ----------------------
-#define I2C_SDA_PIN          6     // Hardware I2C SDA (GPIO 6)
-#define I2C_SCL_PIN          7     // Hardware I2C SCL (GPIO 7)
-#define BOOT_BUTTON_PIN      9     // On-board BOOT Button (GPIO 9, active LOW: Click=HOLD, Hold 1.5s=SLEEP/WAKE)
-#define TARE_PIN_D2          2     // Dedicated External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
-#define UNIT_BUTTON_PIN      4     // External Unit Change Button on D4 (GPIO 4, active LOW / pull to GND)
+#define I2C_SDA_PIN          3     // Hardware I2C SDA (GPIO 6)
+#define I2C_SCL_PIN          4     // Hardware I2C SCL (GPIO 7)
+#define BOOT_BUTTON_PIN      1     // On-board BOOT Button (GPIO 9, active LOW: Click=HOLD, Hold 1.5s=SLEEP/WAKE)
+#define TARE_PIN_D2          0     // Dedicated External Tare Button on D2 (GPIO 2, active LOW / pull to GND)
+#define UNIT_BUTTON_PIN      6     // External Unit Change Button on D4 (GPIO 4, active LOW / pull to GND)
 
 // ---------------------- I2C ADDRESSES ------------------------
 #define NAU7802_I2C_ADDR     0x2A  // Fixed hardware address for NAU7802 ADC
@@ -31,6 +31,8 @@
 #define OLED_SCREEN_WIDTH    128   // OLED display width in pixels
 #define OLED_SCREEN_HEIGHT   32    // 0.91" OLED display height in pixels
 #define OLED_RESET_PIN       -1    // Reset pin # (-1 if sharing Arduino reset)
+#define DISPLAY_ORIENTATION  180   // Display orientation: 0 (normal), 180 (landscape flipped)
+#define OLED_ORIENTATION     DISPLAY_ORIENTATION
 
 // ---------------------- SCALE FILTER & TIMING ----------------
 #define FILTER_SIZE              8       // 8-sample rolling buffer (~200ms window at 40 SPS)

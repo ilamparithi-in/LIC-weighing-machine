@@ -112,6 +112,7 @@ In [weighingmachine/config.h](file:///home/ilam_common/DevHome/GitHub/weighingma
 | `hold` | None | Freeze / unfreeze live weight display |
 | `off` or `sleep` | None | Enter ultra-low power sleep |
 | `c <weight>` | Float (g) | Calibrate scale with reference weight (e.g., `c 500`) |
+| `cp <weight>`| Float (g) | Calibration preview (calculate scale factor without saving) |
 | `offset <val>`| Integer | Manually set raw tare offset count |
 | `factor <val>`| Float | Manually set calibration factor (counts per gram) |
 | `r` or `raw` | None | Inspect raw 24-bit ADC, offset, net counts, and diagnostics |

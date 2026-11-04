@@ -406,6 +406,81 @@ public:
     }
   }
 
+  void previewScaleFactor(float knownWeight) {
+    Serial.printf("\n[PREVIEW] Calculating calibration preview for reference weight: %.2f g...\n", knownWeight);
+
+    char refBuf[22];
+    snprintf(refBuf, sizeof(refBuf), "Ref: %.1fg", knownWeight);
+    if (_display) {
+      _display->showStatus("CAL PREVIEW...", refBuf);
+    }
+
+    const int CAL_SAMPLES = 20;
+    int32_t samples[CAL_SAMPLES];
+    int validSamples = 0;
+    unsigned long start = millis();
+    while (validSamples < CAL_SAMPLES && (millis() - start < 3000)) {
+      int32_t val;
+      if (_scale.readRaw(val, 120)) {
+        samples[validSamples++] = val;
+      }
+      delay(10);
+    }
+
+    if (validSamples >= 10) {
+      // Sort samples
+      for (int i = 1; i < validSamples; i++) {
+        int32_t key = samples[i];
+        int j = i - 1;
+        while (j >= 0 && samples[j] > key) {
+          samples[j + 1] = samples[j];
+          j--;
+        }
+        samples[j + 1] = key;
+      }
+
+      int drop = validSamples / 5;
+      long sum = 0;
+      int used = 0;
+      for (int i = drop; i < validSamples - drop; i++) {
+        sum += samples[i];
+        used++;
+      }
+      int32_t avgVal = (used > 0) ? (sum / used) : samples[validSamples / 2];
+
+      int32_t net = avgVal - _tareOffset;
+      float previewFactor = (float)net / knownWeight;
+
+      Serial.println("--------------------------------------------------");
+      Serial.printf("  [PREVIEW] Samples Count:      %d\n", validSamples);
+      Serial.printf("  [PREVIEW] Trimmed Avg ADC:    %ld\n", (long)avgVal);
+      Serial.printf("  [PREVIEW] Active Tare Offset: %ld\n", (long)_tareOffset);
+      Serial.printf("  [PREVIEW] Net Counts:         %ld\n", (long)net);
+      Serial.printf("  [PREVIEW] Reference Weight:   %.2f g\n", knownWeight);
+      Serial.printf("  [PREVIEW] Preview Factor:     %.4f counts/g\n", previewFactor);
+      Serial.printf("  [PREVIEW] Current Active:     %.4f counts/g\n", _scaleFactor);
+
+      if (_scaleFactor > 0.0001f) {
+        float diff = previewFactor - _scaleFactor;
+        float pct = (diff / _scaleFactor) * 100.0f;
+        Serial.printf("  [PREVIEW] Difference:         %+0.4f (%+0.2f%%)\n", diff, pct);
+      }
+      Serial.println("  [PREVIEW] (Notice: Settings unchanged. Use 'c <weight>' to commit.)");
+      Serial.println("--------------------------------------------------");
+
+      char factorBuf[22];
+      snprintf(factorBuf, sizeof(factorBuf), "P: %.1f c/g", previewFactor);
+      if (_display) {
+        _display->showStatus("PREVIEW DONE", factorBuf, 1500);
+      }
+    } else {
+      Serial.println("[ERROR] Calibration preview failed. ADC timeout or unstable readings.");
+      if (_display) {
+        _display->showStatus("PREVIEW FAILED!", "Check weight", 1200);
+      }
+    }
+  }
+
   void cycleUnit() {
     _currentUnit = (WeightUnit)((_currentUnit + 1) % 4);
     const char* uSym = getUnitSymbol(_currentUnit);
@@ -533,6 +608,7 @@ public:
     Serial.println("  hold           : Toggle weight HOLD freeze");
     Serial.println("  off / sleep    : Enter ultra-low power sleep");
     Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 608')");
+    Serial.println("  cp <weight>    : Calibration preview (calculate scale factor without saving)");
     Serial.println("  offset <val>   : Manually set tare offset (e.g., 'offset 75491')");
     Serial.println("  factor <val>   : Manually set scale factor (e.g., 'factor 93.44')");
     Serial.println("  r              : Read raw ADC and scale diagnostics");
@@ -662,6 +738,14 @@ private:
         }
       } else if (cmd.equalsIgnoreCase("off") || cmd.equalsIgnoreCase("sleep")) {
         enterSleepMode();
+      } else if (cmd.startsWith("cp ") || cmd.startsWith("preview ") || cmd.startsWith("calpreview ")) {
+        int spaceIdx = cmd.indexOf(' ');
+        float weight = cmd.substring(spaceIdx + 1).toFloat();
+        if (weight > 0) {
+          previewScaleFactor(weight);
+        } else {
+          Serial.println("[ERROR] Enter valid weight, e.g.: cp 608");
+        }
       } else if (cmd.startsWith("c ") || cmd.startsWith("cal ")) {
         int spaceIdx = cmd.indexOf(' ');
         float weight = cmd.substring(spaceIdx + 1).toFloat();

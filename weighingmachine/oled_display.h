@@ -52,6 +52,17 @@ public:
     // Ensure Wire frequency and pins are preserved
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
 
+    // Apply configured display orientation (0 = normal, 2 = 180 deg landscape flipped)
+#if (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 180 || DISPLAY_ORIENTATION == 2)) || (defined(OLED_ORIENTATION) && (OLED_ORIENTATION == 180 || OLED_ORIENTATION == 2))
+    _display.setRotation(2);
+#elif (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 90 || DISPLAY_ORIENTATION == 1)) || (defined(OLED_ORIENTATION) && (OLED_ORIENTATION == 90 || OLED_ORIENTATION == 1))
+    _display.setRotation(1);
+#elif (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 270 || DISPLAY_ORIENTATION == 3)) || (defined(OLED_ORIENTATION) && (OLED_ORIENTATION == 270 || OLED_ORIENTATION == 3))
+    _display.setRotation(3);
+#else
+    _display.setRotation(0);
+#endif
+
     _display.clearDisplay();
     _display.setTextColor(SSD1306_WHITE);
     _display.display();
