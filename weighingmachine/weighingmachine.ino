@@ -8,13 +8,14 @@
  * --------------------------------------------------------------------
  * 3V3                     VIN                VCC (3V3 for OLED, 5V/VBUS for LCD)
  * GND                     GND                GND
- * GPIO 6 (SDA)            SDA                SDA
- * GPIO 7 (SCL)            SCL                SCL
+ * GPIO 3 (SDA)            SDA                SDA
+ * GPIO 4 (SCL)            SCL                SCL
  *
- * Button Configuration:
- * - On-board BOOT Button (GPIO 9) : Click = HOLD/UNHOLD, Hold 1.5s = SLEEP/WAKE
- * - External D2 Pin (GPIO 2)     : Dedicated TARE (Zero) button (pull to GND)
- * - External D4 Pin (GPIO 4)     : Dedicated UNIT cycle button (g -> kg -> oz -> lb)
+ * Button Configuration (defined in config.h):
+ * - Pin 1 (HOLD_BUTTON_PIN) : Dedicated HOLD Button (Click = HOLD/UNHOLD, Default Hold 1.5s = SLEEP/WAKE)
+ * - Pin 0 (TARE_BUTTON_PIN) : Dedicated TARE Button (Click = Zero)
+ * - Pin 6 (UNIT_BUTTON_PIN) : Dedicated UNIT Button (Click = Cycle g -> kg -> oz -> lb)
+ * - Pin 7 (PULSE_PIN)       : IP5306 Power Bank Keep-Alive Pulse Pin
  *
  * Load Cell (Standard 4-Wire) to 7Semi NAU7802:
  * --------------------------------------------------------------------
@@ -26,6 +27,7 @@
  */
 
 #include <Arduino.h>
+#include <Wire.h>
 #include "config.h"
 #include "scale_display.h"
 #include "scale_display_factory.h"
@@ -47,6 +49,9 @@ void setup() {
   Serial.println(" ESP32-C3 SuperMini + NAU7802 Digital Scale        ");
   Serial.println(" Pluggable Display Architecture (LCD / OLED)       ");
   Serial.println("====================================================");
+
+  // Initialize hardware I2C bus before display factory probes the bus
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
 
   // Initialize selected or auto-detected display driver
   display = createScaleDisplay(DEFAULT_DISPLAY_MODE);

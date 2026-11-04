@@ -4,8 +4,10 @@
 #include <Wire.h>
 #include <7Semi_NAU7802.h>
 #include <Preferences.h>
+#include <cmath>
 #include "esp_bt.h"
 #include "esp_sleep.h"
+#include "esp_wifi.h"
 
 #include "config.h"
 #include "scale_types.h"
@@ -42,24 +44,26 @@ private:
   bool _isHeld;
   float _heldWeight;
 
-  // Buttons & Inactivity Timers
+  // Timers
   unsigned long _lastActivityTime;
   float _lastActivityWeight;
   unsigned long _lastDisplayUpdate;
 
-  // BOOT button (GPIO 9) tracking
-  unsigned long _bootPressStartTime;
-  bool _bootShutdownTriggered;
-
-  // Tare (D2) and Unit (D4) button debouncing
-  unsigned long _lastTareTriggerTime;
-  bool _tareButtonActive;
-  unsigned long _lastUnitTriggerTime;
-  bool _unitButtonActive;
+  // Button Management
+  unsigned long _holdPressStartTime;
+  unsigned long _tarePressStartTime;
+  unsigned long _unitPressStartTime;
+  bool _powerOffTriggered;
+  unsigned long _lastCountdownUpdate;
+  bool _isShutdownCountdownActive;
 
   // Power Bank Keep-Alive (IP5306)
   unsigned long _lastPowerPulseTime;
   bool _isPowerPulsing;
+
+  // Non-blocking serial command buffer
+  char _serialBuf[48];
+  uint8_t _serialIndex;
 
 public:
   ScaleCore(ScaleDisplay* display)
@@ -81,21 +85,24 @@ public:
       _lastActivityTime(0),
       _lastActivityWeight(0.0f),
       _lastDisplayUpdate(0),
-      _bootPressStartTime(0),
-      _bootShutdownTriggered(false),
-      _lastTareTriggerTime(0),
-      _tareButtonActive(false),
-      _lastUnitTriggerTime(0),
-      _unitButtonActive(false),
+      _holdPressStartTime(0),
+      _tarePressStartTime(0),
+      _unitPressStartTime(0),
+      _powerOffTriggered(false),
+      _lastCountdownUpdate(0),
+      _isShutdownCountdownActive(false),
       _lastPowerPulseTime(0),
-      _isPowerPulsing(false) {
+      _isPowerPulsing(false),
+      _serialIndex(0) {
     for (int i = 0; i < FILTER_SIZE; i++) {
       _adcBuffer[i] = 0;
     }
+    _serialBuf[0] = '\0';
   }
 
   void begin() {
-    // 1. Disable Bluetooth controller to reduce 2.4 GHz RF emissions & power ripple
+    // 1. Disable Radios (Wi-Fi and Bluetooth) to eliminate 2.4 GHz RF emissions & power ripple
+    esp_wifi_stop();
     btStop();
     esp_bt_controller_disable();
     esp_bt_controller_deinit();
@@ -105,8 +112,8 @@ public:
     setCpuFrequencyMhz(80);
 
     // 3. Configure hardware buttons with internal pullups
-    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-    pinMode(TARE_PIN_D2, INPUT_PULLUP);
+    pinMode(HOLD_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(UNIT_BUTTON_PIN, INPUT_PULLUP);
 
 #ifdef POWER_BANK_PULSE_PIN
@@ -118,14 +125,14 @@ public:
                   POWER_BANK_PULSE_PIN, (unsigned long)POWER_BANK_PULSE_INTERVAL_MS);
 #endif
 
-    // If woken from sleep while BOOT button is held, wait for release
+    // If woken from sleep while any button is held, wait for release
     unsigned long releaseStart = millis();
-    while (digitalRead(BOOT_BUTTON_PIN) == LOW && (millis() - releaseStart < 1500)) {
+    while ((digitalRead(HOLD_BUTTON_PIN) == LOW || digitalRead(TARE_BUTTON_PIN) == LOW || digitalRead(UNIT_BUTTON_PIN) == LOW) && (millis() - releaseStart < 1500)) {
       delay(10);
     }
     delay(50);
 
-    // 4. Initialize Hardware I2C Bus on GPIO 6 & 7 at 400kHz
+    // 4. Initialize Hardware I2C Bus at 400kHz
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
     delay(50);
 
@@ -138,14 +145,23 @@ public:
       }
     }
 
-    // 6. Initialize 7Semi NAU7802 24-bit ADC
+    // 6. Initialize 7Semi NAU7802 24-bit ADC with retry
     Serial.println("[INFO] Initializing NAU7802 ADC...");
-    if (!_scale.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000)) {
-      Serial.println("[ERROR] NAU7802 not found! Check wiring (3.3V, GND, SDA, SCL).");
+    int retries = 0;
+    while (!_scale.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000)) {
+      retries++;
+      Serial.printf("[ERROR] NAU7802 not found! Attempt %d/3. Check wiring (3.3V, GND, SDA, SCL).\n", retries);
       if (_display) {
-        _display->showStatus("NAU7802 ERROR!", "Check Wiring");
+        _display->showStatus("NAU7802 RETRY", "Check Wiring", 1000);
       }
-      while (1) delay(1000);
+      if (retries >= 3) {
+        Serial.println("[FATAL] NAU7802 communication failed. Rebooting in 3 seconds...");
+        if (_display) {
+          _display->showStatus("NAU7802 ERROR!", "Rebooting in 3s", 3000);
+        }
+        esp_restart();
+      }
+      delay(500);
     }
 
     // Configure 3.0V internal LDO and 128x PGA
@@ -168,7 +184,7 @@ public:
       Serial.printf("[INFO] Chopper ripple filter set. ADC_CTRL1 = 0x%02X\n", ctrl1);
     }
 
-    // Enable internal LDO
+    // Enable internal LDO and allow rail to settle
     enableInternalLDO();
 
     // Run internal Analog Front-End (AFE) offset calibration
@@ -188,20 +204,18 @@ public:
 
   void update() {
     // 1. Process physical button inputs
-    checkBootButton();
-    checkTareButton();
-    checkUnitButton();
+    checkButtons();
 
     // 1b. Power bank keep-alive pulse (IP5306)
     updatePowerBankPulse();
 
-    // 2. Auto-Shutdown on 2 minutes inactivity
-    if (!_isHeld && (millis() - _lastActivityTime >= AUTO_SHUTDOWN_TIMEOUT_MS)) {
-      Serial.println("[AUTO-OFF] 2 minutes of inactivity reached. Entering sleep mode...");
+    // 2. Auto-Shutdown on inactivity (disabled if AUTO_SHUTDOWN_TIMEOUT_MS <= 0)
+    if (AUTO_SHUTDOWN_TIMEOUT_MS > 0 && !_isHeld && (millis() - _lastActivityTime >= (unsigned long)AUTO_SHUTDOWN_TIMEOUT_MS)) {
+      Serial.println("[AUTO-OFF] Inactivity timeout reached. Entering sleep mode...");
       enterSleepMode();
     }
 
-    // 3. Process Serial Commands
+    // 3. Process Serial Commands (non-blocking)
     processSerial();
 
     // 4. Continuously acquire ADC samples into rolling ring buffer
@@ -220,7 +234,7 @@ public:
         // Multi-tier fast-settling filter:
         // - Delta > 3.0g: Fast slew tracking (70% new sample per frame)
         // - Delta <= 3.0g: Smooth landing (20% new sample per frame)
-        float delta = abs(targetWeight - _filteredWeight);
+        float delta = fabsf(targetWeight - _filteredWeight);
         if (delta > 3.0f) {
           _filteredWeight = (0.70f * targetWeight) + (0.30f * _filteredWeight);
           _isStable = false;
@@ -231,20 +245,20 @@ public:
           if (_stableFrames >= 4) {
             _isStable = true;
             // Lock to stable integer 1g weight with 0.8g hysteresis
-            if (abs(_filteredWeight - _lockedWeight) >= 0.8f) {
+            if (fabsf(_filteredWeight - _lockedWeight) >= 0.8f) {
               _lockedWeight = (float)lround(_filteredWeight);
             }
           }
         }
 
         // Zero-tracking deadband: snap to 0g within +/-1.0g
-        if (abs(_filteredWeight) < 1.0f) {
+        if (fabsf(_filteredWeight) < 1.0f) {
           _filteredWeight = 0.0f;
           _lockedWeight = 0.0f;
         }
 
         // Reset inactivity timer on significant weight change (>= 2.0g)
-        if (abs(_filteredWeight - _lastActivityWeight) >= 2.0f) {
+        if (fabsf(_filteredWeight - _lastActivityWeight) >= 2.0f) {
           _lastActivityWeight = _filteredWeight;
           resetActivityTimer();
         }
@@ -252,11 +266,12 @@ public:
     }
 
     // 5. Refresh display and serial output at 100ms intervals (10 Hz)
-    if (millis() - _lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
+    // Suppress regular weight update if shutdown countdown is actively rendering
+    if (!_isShutdownCountdownActive && (millis() - _lastDisplayUpdate >= DISPLAY_INTERVAL_MS)) {
       _lastDisplayUpdate = millis();
 
       int32_t netCounts = _latestFilteredADC - _tareOffset;
-      bool saturated = (_latestFilteredADC <= -8388600 || _latestFilteredADC >= 8388600);
+      bool saturated = (_latestFilteredADC <= -ADC_SATURATION_LIMIT || _latestFilteredADC >= ADC_SATURATION_LIMIT);
       float liveValue = _isStable ? _lockedWeight : _filteredWeight;
       float displayValue = _isHeld ? _heldWeight : liveValue;
 
@@ -276,8 +291,24 @@ public:
     }
   }
 
+  void toggleHold() {
+    _isHeld = !_isHeld;
+    if (_isHeld) {
+      _heldWeight = _isStable ? _lockedWeight : _filteredWeight;
+      Serial.printf("[HOLD] Weight held at: %.1f g\n", _heldWeight);
+    } else {
+      Serial.println("[HOLD] Weight released (live stream resumed).");
+    }
+    if (_display) {
+      float val = _isHeld ? _heldWeight : (_isStable ? _lockedWeight : _filteredWeight);
+      int32_t netCounts = _latestFilteredADC - _tareOffset;
+      _display->showWeight(val, _currentUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, false);
+    }
+  }
+
   void performTare() {
     Serial.println("[ACTION] Performing Tare (Zeroing)...");
+    if (_isHeld) _isHeld = false;
     float startWeight = _filteredWeight;
 
     // Collect 14 samples and animate smooth fall down to 0
@@ -338,7 +369,7 @@ public:
       _isStable = true;
       _stableFrames = 15;
 
-      saveSettings();
+      // Notice: Operational tare is kept in RAM to protect flash sectors from wear
       Serial.printf("[SUCCESS] Tare locked. Offset = %ld (samples: %d)\n", (long)_tareOffset, validSamples);
 
       if (_display) {
@@ -528,9 +559,16 @@ public:
     Wire.write(0x00); // Shut down digital core, LDO, and PGA
     Wire.endTransmission();
 
-    // Configure BOOT button as wake-up source
-    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
-    gpio_wakeup_enable((gpio_num_t)BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    // Configure RTC pull-ups on RTC-capable GPIOs
+    gpio_pullup_en((gpio_num_t)HOLD_BUTTON_PIN);
+    gpio_pulldown_dis((gpio_num_t)HOLD_BUTTON_PIN);
+    gpio_pullup_en((gpio_num_t)TARE_BUTTON_PIN);
+    gpio_pulldown_dis((gpio_num_t)TARE_BUTTON_PIN);
+
+    // Configure wake-up source on active buttons
+    gpio_wakeup_enable((gpio_num_t)HOLD_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)TARE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)UNIT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 
     Serial.flush();
@@ -541,7 +579,7 @@ public:
 
     // On wake: wait for button release
     unsigned long wakeWaitStart = millis();
-    while (digitalRead(BOOT_BUTTON_PIN) == LOW && (millis() - wakeWaitStart < 1500)) {
+    while ((digitalRead(HOLD_BUTTON_PIN) == LOW || digitalRead(TARE_BUTTON_PIN) == LOW || digitalRead(UNIT_BUTTON_PIN) == LOW) && (millis() - wakeWaitStart < 1500)) {
       delay(10);
     }
     delay(50);
@@ -668,6 +706,8 @@ private:
       Wire.write(pu);
       Wire.endTransmission();
       Serial.printf("[INFO] Internal LDO enabled. PU_CTRL = 0x%02X\n", pu);
+      // Datasheet Rev 2.6 §2.1: Allow internal LDO voltage and bandgap reference to stabilize
+      delay(10);
     }
   }
 
@@ -684,133 +724,156 @@ private:
       Wire.endTransmission();
 
       unsigned long start = millis();
+      bool calComplete = false;
+      bool calError = false;
+
       while (millis() - start < 400) {
         Wire.beginTransmission(NAU7802_I2C_ADDR);
         Wire.write(0x02);
         if (Wire.endTransmission(false) == 0 && Wire.requestFrom((uint8_t)NAU7802_I2C_ADDR, (uint8_t)1) == 1) {
-          if ((Wire.read() & (1 << 2)) == 0) break; // Finished
+          uint8_t ctrl2 = Wire.read();
+          if ((ctrl2 & (1 << 2)) == 0) { // CALS == 0: complete
+            calComplete = true;
+            calError = (ctrl2 & (1 << 3)) != 0; // CAL_ERR bit 3
+            break;
+          }
         }
         delay(10);
       }
-      Serial.println("[INFO] AFE internal offset calibration complete.");
+
+      if (!calComplete) {
+        Serial.println("[WARN] AFE internal offset calibration timed out!");
+      } else if (calError) {
+        Serial.println("[WARN] AFE calibration error detected (CAL_ERR bit set)!");
+      } else {
+        Serial.println("[INFO] AFE internal offset calibration complete (success).");
+      }
     }
   }
 
-  void checkBootButton() {
-    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+  void handleButtonAction(uint8_t pin) {
+    if (pin == HOLD_BUTTON_PIN) {
+      toggleHold();
+    } else if (pin == TARE_BUTTON_PIN) {
+      Serial.println("[BUTTON] Tare requested via button click.");
+      performTare();
+    } else if (pin == UNIT_BUTTON_PIN) {
+      Serial.println("[BUTTON] Unit cycle requested via button click.");
+      cycleUnit();
+    }
+  }
+
+  void checkSingleButton(uint8_t pin, unsigned long& pressStartTime) {
+    if (digitalRead(pin) == LOW) {
       resetActivityTimer();
-      if (_bootPressStartTime == 0) {
-        _bootPressStartTime = millis();
-        _bootShutdownTriggered = false;
-      } else {
-        unsigned long holdMs = millis() - _bootPressStartTime;
-        if (_display && holdMs >= 700 && holdMs < BOOT_SLEEP_HOLD_MS) {
-          _display->showShutdownCountdown((uint16_t)holdMs, (uint16_t)BOOT_SLEEP_HOLD_MS);
-        } else if (holdMs >= BOOT_SLEEP_HOLD_MS && !_bootShutdownTriggered) {
-          _bootShutdownTriggered = true;
+      if (pressStartTime == 0) {
+        pressStartTime = millis();
+        if (pin == POWER_OFF_BUTTON_PIN) {
+          _powerOffTriggered = false;
+        }
+      } else if (pin == POWER_OFF_BUTTON_PIN) {
+        unsigned long holdMs = millis() - pressStartTime;
+        if (holdMs >= 700 && holdMs < POWER_OFF_HOLD_MS) {
+          _isShutdownCountdownActive = true;
+          if (millis() - _lastCountdownUpdate >= 50) {
+            _lastCountdownUpdate = millis();
+            if (_display) {
+              _display->showShutdownCountdown((uint16_t)holdMs, (uint16_t)POWER_OFF_HOLD_MS);
+            }
+          }
+        } else if (holdMs >= POWER_OFF_HOLD_MS && !_powerOffTriggered) {
+          _powerOffTriggered = true;
+          _isShutdownCountdownActive = false;
           enterSleepMode();
         }
       }
     } else {
-      if (_bootPressStartTime > 0) {
-        unsigned long pressDuration = millis() - _bootPressStartTime;
-        _bootPressStartTime = 0;
-        if (!_bootShutdownTriggered && pressDuration >= 80 && pressDuration < BOOT_SLEEP_HOLD_MS) {
-          _isHeld = !_isHeld;
-          if (_isHeld) {
-            _heldWeight = _isStable ? _lockedWeight : _filteredWeight;
-            Serial.printf("[HOLD] Weight held at: %.1f g\n", _heldWeight);
-          } else {
-            Serial.println("[HOLD] Weight unheld (live stream resumed).");
-          }
+      if (pressStartTime > 0) {
+        unsigned long duration = millis() - pressStartTime;
+        pressStartTime = 0;
+        if (pin == POWER_OFF_BUTTON_PIN) {
+          _isShutdownCountdownActive = false;
         }
-        _bootShutdownTriggered = false;
+        bool triggeredShutdown = (pin == POWER_OFF_BUTTON_PIN && _powerOffTriggered);
+        if (!triggeredShutdown && duration >= 80 && duration < POWER_OFF_HOLD_MS) {
+          handleButtonAction(pin);
+        }
+        if (pin == POWER_OFF_BUTTON_PIN) {
+          _powerOffTriggered = false;
+        }
       }
     }
   }
 
-  void checkTareButton() {
-    if (digitalRead(TARE_PIN_D2) == LOW) {
-      if (!_tareButtonActive && (millis() - _lastTareTriggerTime > 300)) {
-        _tareButtonActive = true;
-        _lastTareTriggerTime = millis();
-        resetActivityTimer();
-        if (_isHeld) _isHeld = false;
-        Serial.println("[BUTTON] Tare requested via D2 pin.");
-        performTare();
-      }
-    } else {
-      _tareButtonActive = false;
-    }
+  void checkButtons() {
+    checkSingleButton(HOLD_BUTTON_PIN, _holdPressStartTime);
+    checkSingleButton(TARE_BUTTON_PIN, _tarePressStartTime);
+    checkSingleButton(UNIT_BUTTON_PIN, _unitPressStartTime);
   }
 
-  void checkUnitButton() {
-    if (digitalRead(UNIT_BUTTON_PIN) == LOW) {
-      if (!_unitButtonActive && (millis() - _lastUnitTriggerTime > 250)) {
-        _unitButtonActive = true;
-        _lastUnitTriggerTime = millis();
-        resetActivityTimer();
-        cycleUnit();
+  void handleSerialCommand(String cmd) {
+    cmd.trim();
+    resetActivityTimer();
+
+    if (cmd.equalsIgnoreCase("t") || cmd.equalsIgnoreCase("tare")) {
+      performTare();
+    } else if (cmd.equalsIgnoreCase("u") || cmd.equalsIgnoreCase("unit")) {
+      cycleUnit();
+    } else if (cmd.equalsIgnoreCase("hold")) {
+      toggleHold();
+    } else if (cmd.equalsIgnoreCase("off") || cmd.equalsIgnoreCase("sleep")) {
+      enterSleepMode();
+    } else if (cmd.startsWith("cp ") || cmd.startsWith("preview ") || cmd.startsWith("calpreview ")) {
+      int spaceIdx = cmd.indexOf(' ');
+      float weight = cmd.substring(spaceIdx + 1).toFloat();
+      if (weight > 0) {
+        previewScaleFactor(weight);
+      } else {
+        Serial.println("[ERROR] Enter valid weight, e.g.: cp 608");
       }
-    } else {
-      _unitButtonActive = false;
+    } else if (cmd.startsWith("c ") || cmd.startsWith("cal ")) {
+      int spaceIdx = cmd.indexOf(' ');
+      float weight = cmd.substring(spaceIdx + 1).toFloat();
+      if (weight > 0) {
+        calibrateScaleWithWeight(weight);
+      } else {
+        Serial.println("[ERROR] Enter valid weight, e.g.: c 608");
+      }
+    } else if (cmd.startsWith("offset ")) {
+      int32_t off = cmd.substring(7).toInt();
+      _tareOffset = off;
+      saveSettings();
+      Serial.printf("[INFO] Manual TareOffset set to: %ld\n", (long)_tareOffset);
+    } else if (cmd.startsWith("factor ")) {
+      float f = cmd.substring(7).toFloat();
+      if (f > 0) {
+        _scaleFactor = f;
+        saveSettings();
+        Serial.printf("[INFO] Manual ScaleFactor set to: %.4f\n", _scaleFactor);
+      }
+    } else if (cmd.equalsIgnoreCase("r") || cmd.equalsIgnoreCase("raw")) {
+      int32_t rawVal = getTrimmedMeanADC();
+      Serial.printf("[RAW] FilteredADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n",
+                    (long)rawVal, (long)_tareOffset, (long)(rawVal - _tareOffset), _scaleFactor);
+    } else if (cmd.equalsIgnoreCase("h") || cmd.equalsIgnoreCase("help")) {
+      printHelp();
     }
   }
 
   void processSerial() {
-    if (Serial.available()) {
-      String cmd = Serial.readStringUntil('\n');
-      cmd.trim();
-      resetActivityTimer();
-
-      if (cmd.equalsIgnoreCase("t") || cmd.equalsIgnoreCase("tare")) {
-        performTare();
-      } else if (cmd.equalsIgnoreCase("u") || cmd.equalsIgnoreCase("unit")) {
-        cycleUnit();
-      } else if (cmd.equalsIgnoreCase("hold")) {
-        _isHeld = !_isHeld;
-        if (_isHeld) {
-          _heldWeight = _isStable ? _lockedWeight : _filteredWeight;
-          Serial.printf("[HOLD] Weight held at: %.1f g\n", _heldWeight);
-        } else {
-          Serial.println("[HOLD] Weight released.");
+    while (Serial.available()) {
+      char c = (char)Serial.read();
+      if (c == '\r') continue;
+      if (c == '\n') {
+        _serialBuf[_serialIndex] = '\0';
+        if (_serialIndex > 0) {
+          handleSerialCommand(String(_serialBuf));
+          _serialIndex = 0;
         }
-      } else if (cmd.equalsIgnoreCase("off") || cmd.equalsIgnoreCase("sleep")) {
-        enterSleepMode();
-      } else if (cmd.startsWith("cp ") || cmd.startsWith("preview ") || cmd.startsWith("calpreview ")) {
-        int spaceIdx = cmd.indexOf(' ');
-        float weight = cmd.substring(spaceIdx + 1).toFloat();
-        if (weight > 0) {
-          previewScaleFactor(weight);
-        } else {
-          Serial.println("[ERROR] Enter valid weight, e.g.: cp 608");
+      } else {
+        if (_serialIndex < sizeof(_serialBuf) - 1) {
+          _serialBuf[_serialIndex++] = c;
         }
-      } else if (cmd.startsWith("c ") || cmd.startsWith("cal ")) {
-        int spaceIdx = cmd.indexOf(' ');
-        float weight = cmd.substring(spaceIdx + 1).toFloat();
-        if (weight > 0) {
-          calibrateScaleWithWeight(weight);
-        } else {
-          Serial.println("[ERROR] Enter valid weight, e.g.: c 608");
-        }
-      } else if (cmd.startsWith("offset ")) {
-        int32_t off = cmd.substring(7).toInt();
-        _tareOffset = off;
-        saveSettings();
-        Serial.printf("[INFO] Manual TareOffset set to: %ld\n", (long)_tareOffset);
-      } else if (cmd.startsWith("factor ")) {
-        float f = cmd.substring(7).toFloat();
-        if (f > 0) {
-          _scaleFactor = f;
-          saveSettings();
-          Serial.printf("[INFO] Manual ScaleFactor set to: %.4f\n", _scaleFactor);
-        }
-      } else if (cmd.equalsIgnoreCase("r") || cmd.equalsIgnoreCase("raw")) {
-        int32_t rawVal = getTrimmedMeanADC();
-        Serial.printf("[RAW] FilteredADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n",
-                      (long)rawVal, (long)_tareOffset, (long)(rawVal - _tareOffset), _scaleFactor);
-      } else if (cmd.equalsIgnoreCase("h") || cmd.equalsIgnoreCase("help")) {
-        printHelp();
       }
     }
   }

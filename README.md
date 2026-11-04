@@ -6,7 +6,7 @@ A high-precision, production-grade digital weighing scale firmware running on th
 
 ## 1. Hardware Architecture & Wiring
 
-Both the **7Semi NAU7802** and the chosen display share the hardware I2C bus on the ESP32-C3 SuperMini (`GPIO 6` for SDA, `GPIO 7` for SCL).
+Both the **7Semi NAU7802** and the chosen display share the I2C bus on the ESP32-C3 SuperMini (`GPIO 3` for SDA, `GPIO 4` for SCL).
 
 ### Connection Table
 
@@ -15,11 +15,12 @@ Both the **7Semi NAU7802** and the chosen display share the hardware I2C bus on 
 | **3V3** | **VIN** | - | **VCC** | Power for NAU7802 and OLED |
 | **5V / VBUS** | - | **VCC** | - | Power for LCD (5V backlight) |
 | **GND** | **GND** | **GND** | **GND** | Common Ground |
-| **GPIO 6** | **SDA** | **SDA** | **SDA** | Hardware I2C Data line |
-| **GPIO 7** | **SCL** | **SCL** | **SCL** | Hardware I2C Clock line |
-| **GPIO 9 (BOOT Button)**| - | - | - | **Power / HOLD Button**:<br>- Short Press: Toggle HOLD on/off<br>- Hold 1.5s: Enter Sleep (Power Off)<br>- Press while Off: Wake up |
-| **GPIO 2 (D2 Pin)**     | - | - | - | **Dedicated TARE Button** (Pull to GND) |
-| **GPIO 4 (D4 Pin)**     | - | - | - | **Dedicated UNIT Button** (Cycle g/kg/oz/lb) |
+| **GPIO 3** | **SDA** | **SDA** | **SDA** | I2C Data line |
+| **GPIO 4** | **SCL** | **SCL** | **SCL** | I2C Clock line |
+| **GPIO 1** | - | - | - | **Dedicated HOLD Button**:<br>- Short Press: Toggle HOLD on/off<br>- Hold 1.5s: Enter Sleep (Power Off, configurable in config.h)<br>- Press while Off: Wake up |
+| **GPIO 0** | - | - | - | **Dedicated TARE Button** (Pull to GND to Zero) |
+| **GPIO 6** | - | - | - | **Dedicated UNIT Button** (Cycle g/kg/oz/lb) |
+| **GPIO 7** | - | - | - | **Power Bank Keep-Alive** (Pulses IP5306 keypad every 10s) |
 
 > **I2C Addresses**:
 > - **7Semi NAU7802 ADC**: `0x2A` (fixed by hardware)
@@ -37,7 +38,7 @@ Both the **7Semi NAU7802** and the chosen display share the hardware I2C bus on 
 | **Green** | `A+` | Signal Output Positive |
 | **White** | `A-` | Signal Output Negative |
 
-*(If reading decreases when weight is placed on the platform, swap `A+` and `A-`).*
+*(If reading decreases/goes negative when weight is placed on the platform, swap `A+` and `A-`).*
 
 ---
 
@@ -67,9 +68,9 @@ In [weighingmachine/config.h](file:///home/ilam_common/DevHome/GitHub/weighingma
 #define DEFAULT_DISPLAY_MODE DISPLAY_MODE_AUTO
 ```
 
-- **`DISPLAY_MODE_AUTO` (Default)**: Dynamically probes the I2C bus at startup. If an OLED (`0x3C`/`0x3D`) is detected, it loads the OLED graphics engine. If an LCD (`0x27`/`0x3F`) is detected, it loads the LCD driver. **Zero code modifications required when swapping hardware!**
-- **`DISPLAY_MODE_LCD`**: Explicitly locks to the I2C 16x2 LCD.
-- **`DISPLAY_MODE_OLED`**: Explicitly locks to the 0.91" I2C OLED.
+- **`DISPLAY_MODE_AUTO` (Default)**: Dynamically probes the I2C bus at startup. If an OLED (`0x3C`/`0x3D`) is detected, it loads the OLED graphics engine. If an LCD (`0x27`/`0x3F`) is detected, it loads the LCD driver. 
+- **`DISPLAY_MODE_LCD`**: I2C 16x2 LCD with PCF8574 backpack.
+- **`DISPLAY_MODE_OLED`**: I2C 0.91" OLED.
 
 ---
 
@@ -82,23 +83,23 @@ In [weighingmachine/config.h](file:///home/ilam_common/DevHome/GitHub/weighingma
   * Settling (<= 3.0g): Smooth landing (20% new sample per frame) with trimmed-mean averaging (discards highest and lowest outliers) to cancel chopper ripple and mechanical vibration.
   * Hysteresis locking: 1g integer resolution lock with 0.8g hysteresis band to eliminate digit jitter.
   * Zero-tracking deadband: Automatically snaps to exact 0 within ±1.0g.
-* **Instant Unit Cycling**: Dedicated button on D4 (GPIO 4) cycles through `g` -> `kg` -> `oz` -> `lb` instantaneously with zero screen flicker or lag.
-* **Quadratic Tare Animation**: Pressing Tare on D2 (GPIO 2) or via Serial animates the live reading gracefully falling to 0 with quadratic deceleration (`remain * remain`).
-* **Non-Volatile Calibration**: Calibration scale factor, tare zero offset, and active unit are saved to ESP32 Flash memory via `Preferences` and restored on boot.
-* **Ultra-Low Power Sleep**: BOOT button (GPIO 9) long-press (1.5s) enters light sleep (~0.13mA). Auto-shutdown automatically turns off the scale after 2 minutes of inactivity. Pressing BOOT wakes the system back up instantly.
+* **Instant Unit Cycling**: Dedicated button on GPIO 6 cycles through `g` -> `kg` -> `oz` -> `lb` instantaneously with zero screen flicker or lag.
+* **Quadratic Tare Animation**: Pressing Tare on GPIO 0 or via Serial animates the live reading gracefully falling to 0 with quadratic deceleration (`remain * remain`). Routine zeroing is kept in RAM to protect flash memory from sector wear.
+* **Non-Volatile Calibration**: Calibration scale factor, zero offset, and active unit are saved to ESP32 Flash memory via `Preferences` during calibration and restored on boot.
+* **Ultra-Low Power Sleep**: Dedicated power button (GPIO 1 by default, assignable in `config.h`) long-press (1.5s) enters light sleep (~0.13mA). Auto-shutdown automatically turns off the scale after 2 minutes of inactivity (can be disabled in `config.h`). Pressing any button wakes the system back up instantly.
 
 ---
 
 ## 4. Calibration & Serial Console
 
 ### Quick Calibration Steps:
-1. Open the Serial Monitor at **115200 baud** (or press the Tare button on GPIO 2).
+1. Open the Serial Monitor at **115200 baud** (or press the Tare button on GPIO 0).
 2. With the platform empty, send:
    ```text
    t
    ```
-3. Place a known reference weight on the scale (e.g. 100g, 500g, or 608g).
-4. Send the calibration command with the weight value in grams:
+3. Place a known reference weight on the scale (e.g. 100g, 500g, or 1kg).
+4. Send the calibration command with the weight value **in grams**:
    ```text
    c 500
    ```
@@ -146,7 +147,7 @@ arduino-cli upload -p /dev/ttyACM0 --fqbn esp32:esp32:esp32c3 weighingmachine
 
 ### Using Arduino IDE
 
-1. Open [weighingmachine/weighingmachine.ino](file:///home/ilam_common/DevHome/GitHub/weighingmachine/weighingmachine/weighingmachine.ino) in the Arduino IDE.
-2. Select Board: **ESP32C3 Dev Module** or **ESP32-C3 SuperMini**.
+1. Open weighingmachine/weighingmachine.ino in the Arduino IDE.
+2. Select Board: **ESP32C3 Dev Module** or **Nologo ESP32-C3 Super Mini**.
 3. Choose your USB port.
 4. Click **Upload**.

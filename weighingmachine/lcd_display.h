@@ -65,23 +65,25 @@ public:
     // Line 0: Weight value + Unit + Activity indicator
     char weightBuf[16];
     formatWeightString(weight, unit, weightBuf, sizeof(weightBuf));
-    char lineBuf[17];
-    snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s  %c", weightBuf, isHeld ? 'H' : (_tick ? '*' : ' '));
+    char lineBuf[24];
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%-10s %c", weightBuf, isHeld ? 'H' : (_tick ? '*' : ' '));
+    lineBuf[16] = '\0'; // Guarantee 16 chars for 16x2 LCD
     _lcd->setCursor(0, 0);
     _lcd->print(lineBuf);
 
     // Line 1: Status & Net ADC counts or saturation warning
     _lcd->setCursor(0, 1);
-    if (saturated || rawADC <= -8388600 || rawADC >= 8388600) {
+    if (saturated || rawADC <= -ADC_SATURATION_LIMIT || rawADC >= ADC_SATURATION_LIMIT) {
       _lcd->print("ADC SATURATED!  ");
     } else {
       if (isHeld) {
-        snprintf(lineBuf, sizeof(lineBuf), "HOLD    %6ld", (long)netCounts);
+        snprintf(lineBuf, sizeof(lineBuf), "HOLD    %7ld", (long)netCounts);
       } else if (isStable) {
-        snprintf(lineBuf, sizeof(lineBuf), "STABLE  %6ld", (long)netCounts);
+        snprintf(lineBuf, sizeof(lineBuf), "STABLE  %7ld", (long)netCounts);
       } else {
-        snprintf(lineBuf, sizeof(lineBuf), "Net:    %6ld", (long)netCounts);
+        snprintf(lineBuf, sizeof(lineBuf), "Net:    %7ld", (long)netCounts);
       }
+      lineBuf[16] = '\0';
       _lcd->print(lineBuf);
     }
   }
@@ -90,10 +92,23 @@ public:
     if (!_lcd) return;
     char weightBuf[16];
     formatWeightString(animWeight, unit, weightBuf, sizeof(weightBuf));
-    char lineBuf[17];
-    snprintf(lineBuf, sizeof(lineBuf), "Wt:%9s   ", weightBuf);
+    char lineBuf[24];
+    snprintf(lineBuf, sizeof(lineBuf), "Wt:%-10s   ", weightBuf);
+    lineBuf[16] = '\0';
     _lcd->setCursor(0, 0);
     _lcd->print(lineBuf);
+  }
+
+  virtual void showShutdownCountdown(uint16_t holdMs, uint16_t maxHoldMs) override {
+    if (!_lcd) return;
+    if (holdMs >= 700 && holdMs < maxHoldMs) {
+      uint16_t remainMs = (maxHoldMs > holdMs) ? (maxHoldMs - holdMs) : 0;
+      char lineBuf[24];
+      snprintf(lineBuf, sizeof(lineBuf), "OFF IN: %1.1fs   ", (float)remainMs / 1000.0f);
+      lineBuf[16] = '\0';
+      _lcd->setCursor(0, 1);
+      _lcd->print(lineBuf);
+    }
   }
 
   virtual void showStatus(const char* line1, const char* line2 = nullptr, uint16_t delayMs = 0) override {

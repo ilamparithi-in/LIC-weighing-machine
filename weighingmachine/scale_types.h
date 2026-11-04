@@ -1,6 +1,11 @@
 #pragma once
 
 #include <Arduino.h>
+#include <cmath>
+
+// ---------------------- CONVERSION CONSTANTS -----------------
+constexpr float GRAMS_PER_OUNCE = 28.349523f;
+constexpr float GRAMS_PER_POUND = 453.59237f;
 
 // ---------------------- UNITS OF MEASURE --------------------
 enum WeightUnit {
@@ -41,19 +46,19 @@ inline void formatWeightString(float grams, WeightUnit unit, char* outBuf, size_
   switch (unit) {
     case UNIT_KG: {
       float kg = grams / 1000.0f;
-      if (abs(kg) < 0.0005f) kg = 0.0f;
+      if (fabsf(kg) < 0.0005f) kg = 0.0f;
       snprintf(outBuf, maxLen, "%.3f kg", kg);
       break;
     }
     case UNIT_OZ: {
-      float oz = grams / 28.349523f;
-      if (abs(oz) < 0.005f) oz = 0.0f;
+      float oz = grams / GRAMS_PER_OUNCE;
+      if (fabsf(oz) < 0.005f) oz = 0.0f;
       snprintf(outBuf, maxLen, "%.2f oz", oz);
       break;
     }
     case UNIT_LB: {
-      float lb = grams / 453.59237f;
-      if (abs(lb) < 0.0005f) lb = 0.0f;
+      float lb = grams / GRAMS_PER_POUND;
+      if (fabsf(lb) < 0.0005f) lb = 0.0f;
       snprintf(outBuf, maxLen, "%.3f lb", lb);
       break;
     }
@@ -73,19 +78,19 @@ inline void formatWeightNumber(float grams, WeightUnit unit, char* outBuf, size_
   switch (unit) {
     case UNIT_KG: {
       float kg = grams / 1000.0f;
-      if (abs(kg) < 0.0005f) kg = 0.0f;
+      if (fabsf(kg) < 0.0005f) kg = 0.0f;
       snprintf(outBuf, maxLen, "%.3f", kg);
       break;
     }
     case UNIT_OZ: {
-      float oz = grams / 28.349523f;
-      if (abs(oz) < 0.005f) oz = 0.0f;
+      float oz = grams / GRAMS_PER_OUNCE;
+      if (fabsf(oz) < 0.005f) oz = 0.0f;
       snprintf(outBuf, maxLen, "%.2f", oz);
       break;
     }
     case UNIT_LB: {
-      float lb = grams / 453.59237f;
-      if (abs(lb) < 0.0005f) lb = 0.0f;
+      float lb = grams / GRAMS_PER_POUND;
+      if (fabsf(lb) < 0.0005f) lb = 0.0f;
       snprintf(outBuf, maxLen, "%.3f", lb);
       break;
     }

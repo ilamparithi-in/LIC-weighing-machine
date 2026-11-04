@@ -49,15 +49,15 @@ public:
       return false;
     }
 
-    // Ensure Wire frequency and pins are preserved
-    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+    // Preserve 400kHz fast I2C bus speed
+    Wire.setClock(400000);
 
     // Apply configured display orientation (0 = normal, 2 = 180 deg landscape flipped)
-#if (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 180 || DISPLAY_ORIENTATION == 2)) || (defined(OLED_ORIENTATION) && (OLED_ORIENTATION == 180 || OLED_ORIENTATION == 2))
+#if (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 180 || DISPLAY_ORIENTATION == 2))
     _display.setRotation(2);
-#elif (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 90 || DISPLAY_ORIENTATION == 1)) || (defined(OLED_ORIENTATION) && (OLED_ORIENTATION == 90 || OLED_ORIENTATION == 1))
+#elif (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 90 || DISPLAY_ORIENTATION == 1))
     _display.setRotation(1);
-#elif (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 270 || DISPLAY_ORIENTATION == 3)) || (defined(OLED_ORIENTATION) && (OLED_ORIENTATION == 270 || OLED_ORIENTATION == 3))
+#elif (defined(DISPLAY_ORIENTATION) && (DISPLAY_ORIENTATION == 270 || DISPLAY_ORIENTATION == 3))
     _display.setRotation(3);
 #else
     _display.setRotation(0);
@@ -76,7 +76,7 @@ public:
     _display.clearDisplay();
     _display.setTextColor(SSD1306_WHITE);
 
-    if (saturated || rawADC <= -8388600 || rawADC >= 8388600) {
+    if (saturated || rawADC <= -ADC_SATURATION_LIMIT || rawADC >= ADC_SATURATION_LIMIT) {
       _display.setTextSize(2);
       _display.setCursor(4, 8);
       _display.print("! OVERLOAD !");
