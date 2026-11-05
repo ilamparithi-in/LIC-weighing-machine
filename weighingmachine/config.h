@@ -46,13 +46,27 @@
 
 // ---------------------- SCALE FILTER & TIMING ----------------
 #define ADC_SATURATION_LIMIT         8388600 // 24-bit ADC saturation boundary (full scale 8,388,607)
-#define FILTER_SIZE                  8       // 8-sample rolling buffer (~200ms window at 40 SPS)
+#define FILTER_SIZE                  16      // 16-sample rolling buffer (~400ms window at 40 SPS)
 #define DISPLAY_INTERVAL_MS          100     // 10 Hz display update rate
 #define POWER_OFF_HOLD_MS            1500    // 1.5 seconds hold for power off / deep sleep
 #define BOOT_SLEEP_HOLD_MS           POWER_OFF_HOLD_MS
 #define AUTO_SHUTDOWN_TIMEOUT_MS     -1      // inactivity timeout in ms (set <= 0 to disable)
 #define POWER_BANK_PULSE_INTERVAL_MS 10000   // IP5306 keep-alive pulse interval (10 seconds)
 #define POWER_BANK_PULSE_DURATION_MS 100     // IP5306 keep-alive pull-to-GND pulse duration (100 ms)
+
+// ---------------------- RAW ADC METROLOGY & STABILITY --------
+// All filtering, stability, and zero-tracking operate directly in native ADC
+// raw counts, completely decoupled from calibrated scale factor / sensitivity.
+#define FILTER_SLEW_COUNTS           280     // Slew delta threshold in ADC counts (~3g @ 93 cnt/g)
+#define FILTER_SETTLE_COUNTS         140     // Settle delta threshold in ADC counts (~1.5g @ 93 cnt/g)
+#define STABILITY_WINDOW_SIZE        12      // 12-sample rolling window (~300ms at 40 SPS)
+#define STABILITY_SPREAD_COUNTS      85      // Max peak-to-peak variation in raw counts for stability
+#define STABILITY_CONFIRM_FRAMES     10      // Frames within limit required to declare stable (~250ms)
+#define ZERO_DEADBAND_COUNTS         55      // Center-of-Zero breakout threshold (~0.6g, detects 1g+ weights)
+#define ZERO_RELEASE_COUNTS          30      // Center-of-Zero return threshold (~0.3g, 25 count hysteresis)
+#define AUTO_ZERO_BAND_COUNTS        35      // Zero-tracking window (~0.37g, will not swallow small items)
+#define AUTO_ZERO_MAX_STEP_COUNTS    1       // Max zero-tracking step per conversion frame (counts)
+#define DISPLAY_LOCK_HYSTERESIS_G    0.75f   // Grams hysteresis required to break integer display lock
 
 // ---------------------- DEFAULT CALIBRATION ------------------
 #define DEFAULT_SCALE_FACTOR     93.44f  // Default counts per gram

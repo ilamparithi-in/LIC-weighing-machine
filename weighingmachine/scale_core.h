@@ -30,15 +30,22 @@ private:
   bool _isCalibrated;
   WeightUnit _currentUnit;
 
-  // Digital Filtering & Rolling Buffer
+  // Digital Filtering & Rolling Buffer (operating directly in native ADC counts)
   int32_t _adcBuffer[FILTER_SIZE];
   int _bufferIndex;
   bool _bufferFull;
-  float _filteredWeight;
-  float _lockedWeight;
+  int32_t _rawADC;              // Literal untouched 24-bit raw ADC reading direct from hardware
+  int32_t _latestFilteredADC;   // 16-sample trimmed-mean ADC from rolling buffer
+  float _filteredADC;           // EMA-filtered ADC count (floating point for smooth tracking)
+  float _lockedWeight;          // Stable locked display weight (in grams)
   bool _isStable;
   int _stableFrames;
-  int32_t _latestFilteredADC;
+
+  // Metrology & Stability State (Native ADC Counts)
+  float _stabilityBuffer[STABILITY_WINDOW_SIZE];
+  int _stabilityIndex;
+  bool _stabilityFilled;
+  float _autoZeroCorrection;    // In native ADC counts
 
   // Hold State
   bool _isHeld;
@@ -75,11 +82,15 @@ public:
       _currentUnit(UNIT_G),
       _bufferIndex(0),
       _bufferFull(false),
-      _filteredWeight(0.0f),
+      _rawADC(0),
+      _latestFilteredADC(0),
+      _filteredADC(0.0f),
       _lockedWeight(0.0f),
       _isStable(false),
       _stableFrames(0),
-      _latestFilteredADC(0),
+      _stabilityIndex(0),
+      _stabilityFilled(false),
+      _autoZeroCorrection(0.0f),
       _isHeld(false),
       _heldWeight(0.0f),
       _lastActivityTime(0),
@@ -96,6 +107,9 @@ public:
       _serialIndex(0) {
     for (int i = 0; i < FILTER_SIZE; i++) {
       _adcBuffer[i] = 0;
+    }
+    for (int i = 0; i < STABILITY_WINDOW_SIZE; i++) {
+      _stabilityBuffer[i] = 0.0f;
     }
     _serialBuf[0] = '\0';
   }
@@ -222,44 +236,73 @@ public:
     if (_scale.available()) {
       int32_t val = 0;
       if (_scale.readRaw(val, 5)) {
+        _rawADC = val; // Untouched 24-bit raw hardware reading
         _adcBuffer[_bufferIndex] = val;
         _bufferIndex = (_bufferIndex + 1) % FILTER_SIZE;
         if (_bufferIndex == 0) _bufferFull = true;
 
-        // Trimmed-mean average from buffer
+        // 1. Trimmed-mean average from buffer (removes impulse glitches/spikes)
         _latestFilteredADC = getTrimmedMeanADC();
-        int32_t netCounts = _latestFilteredADC - _tareOffset;
-        float targetWeight = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
 
-        // Multi-tier fast-settling filter:
-        // - Delta > 3.0g: Fast slew tracking (70% new sample per frame)
-        // - Delta <= 3.0g: Smooth landing (20% new sample per frame)
-        float delta = fabsf(targetWeight - _filteredWeight);
-        if (delta > 3.0f) {
-          _filteredWeight = (0.70f * targetWeight) + (0.30f * _filteredWeight);
+        // 2. Multi-tier adaptive EMA filter operating in native ADC counts:
+        // - Delta > FILTER_SLEW_COUNTS (280 cnts): Fast slew tracking (60% new sample per frame)
+        // - FILTER_SETTLE_COUNTS < Delta <= FILTER_SLEW_COUNTS (140-280 cnts): Fine settling (20% new sample per frame)
+        // - Delta <= FILTER_SETTLE_COUNTS (<= 140 cnts): Quiescent noise suppression (8% new sample per frame)
+        float deltaADC = fabsf((float)_latestFilteredADC - _filteredADC);
+        if (deltaADC > (float)FILTER_SLEW_COUNTS) {
+          _filteredADC = (0.60f * (float)_latestFilteredADC) + (0.40f * _filteredADC);
           _isStable = false;
           _stableFrames = 0;
+        } else if (deltaADC > (float)FILTER_SETTLE_COUNTS) {
+          _filteredADC = (0.20f * (float)_latestFilteredADC) + (0.80f * _filteredADC);
         } else {
-          _filteredWeight = (0.20f * targetWeight) + (0.80f * _filteredWeight);
-          if (_stableFrames < 20) _stableFrames++;
-          if (_stableFrames >= 4) {
-            _isStable = true;
-            // Lock to stable integer 1g weight with 0.8g hysteresis
-            if (fabsf(_filteredWeight - _lockedWeight) >= 0.8f) {
-              _lockedWeight = (float)lround(_filteredWeight);
-            }
+          _filteredADC = (0.08f * (float)_latestFilteredADC) + (0.92f * _filteredADC);
+        }
+
+        // 3. Rolling Window Peak-to-Peak Stability Evaluation in native ADC counts
+        updateStability(_filteredADC);
+
+        // 4. Rate-Limited Auto-Zero Tracking in native ADC counts
+        updateAutoZero();
+
+        // 5. Net counts and Zero Deadband with Hysteresis in native ADC counts
+        float netCounts = _filteredADC - (float)_tareOffset - _autoZeroCorrection;
+        float absNet = fabsf(netCounts);
+
+        bool atZero = false;
+        if (_lockedWeight == 0.0f) {
+          // While currently at zero, require >= ZERO_DEADBAND_COUNTS (100 cnts) to break out
+          if (absNet < (float)ZERO_DEADBAND_COUNTS) {
+            atZero = true;
+          }
+        } else {
+          // While non-zero, require < ZERO_RELEASE_COUNTS (65 cnts) to return to zero
+          if (absNet < (float)ZERO_RELEASE_COUNTS) {
+            atZero = true;
           }
         }
 
-        // Zero-tracking deadband: snap to 0g within +/-1.0g
-        if (fabsf(_filteredWeight) < 1.0f) {
-          _filteredWeight = 0.0f;
+        // Converted weight in grams
+        float rawWeight = (_scaleFactor != 0) ? (netCounts / _scaleFactor) : 0.0f;
+
+        if (atZero) {
           _lockedWeight = 0.0f;
+        } else {
+          if (_isStable) {
+            // When stable, lock firmly to integer weight to eliminate display jitter.
+            // Only update locked weight if the settled weight genuinely drifts >= DISPLAY_LOCK_HYSTERESIS_G
+            if (_lockedWeight == 0.0f || fabsf(rawWeight - _lockedWeight) >= DISPLAY_LOCK_HYSTERESIS_G) {
+              _lockedWeight = (float)lround(rawWeight);
+            }
+          } else {
+            // While moving / slewing, track live rounded weight smoothly
+            _lockedWeight = (float)lround(rawWeight);
+          }
         }
 
         // Reset inactivity timer on significant weight change (>= 2.0g)
-        if (fabsf(_filteredWeight - _lastActivityWeight) >= 2.0f) {
-          _lastActivityWeight = _filteredWeight;
+        if (fabsf(rawWeight - _lastActivityWeight) >= 2.0f) {
+          _lastActivityWeight = rawWeight;
           resetActivityTimer();
         }
       }
@@ -270,9 +313,9 @@ public:
     if (!_isShutdownCountdownActive && (millis() - _lastDisplayUpdate >= DISPLAY_INTERVAL_MS)) {
       _lastDisplayUpdate = millis();
 
-      int32_t netCounts = _latestFilteredADC - _tareOffset;
+      int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
       bool saturated = (_latestFilteredADC <= -ADC_SATURATION_LIMIT || _latestFilteredADC >= ADC_SATURATION_LIMIT);
-      float liveValue = _isStable ? _lockedWeight : _filteredWeight;
+      float liveValue = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
       float displayValue = _isHeld ? _heldWeight : liveValue;
 
       if (_display) {
@@ -284,7 +327,7 @@ public:
         char serWeightBuf[20];
         formatWeightString(displayValue, _currentUnit, serWeightBuf, sizeof(serWeightBuf));
         Serial.printf("Weight: %s | Raw: %ld | Net: %ld | %s%s\n",
-                      serWeightBuf, (long)_latestFilteredADC, (long)netCounts,
+                      serWeightBuf, (long)_rawADC, (long)netCounts,
                       _isHeld ? "[HOLD] " : "",
                       _isStable ? "[STABLE]" : "[MOVING]");
       }
@@ -293,15 +336,16 @@ public:
 
   void toggleHold() {
     _isHeld = !_isHeld;
+    int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
+    float currentVal = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
     if (_isHeld) {
-      _heldWeight = _isStable ? _lockedWeight : _filteredWeight;
+      _heldWeight = currentVal;
       Serial.printf("[HOLD] Weight held at: %.1f g\n", _heldWeight);
     } else {
       Serial.println("[HOLD] Weight released (live stream resumed).");
     }
     if (_display) {
-      float val = _isHeld ? _heldWeight : (_isStable ? _lockedWeight : _filteredWeight);
-      int32_t netCounts = _latestFilteredADC - _tareOffset;
+      float val = _isHeld ? _heldWeight : currentVal;
       _display->showWeight(val, _currentUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, false);
     }
   }
@@ -309,7 +353,7 @@ public:
   void performTare() {
     Serial.println("[ACTION] Performing Tare (Zeroing)...");
     if (_isHeld) _isHeld = false;
-    float startWeight = _filteredWeight;
+    float startWeight = _lockedWeight;
 
     // Collect 14 samples and animate smooth fall down to 0
     const int TARE_SAMPLES = 14;
@@ -357,6 +401,9 @@ public:
 
       _scale.setTareOffset(_tareOffset);
 
+      // Reset auto-zero tracking correction
+      _autoZeroCorrection = 0.0f;
+
       // Flush filter buffer with new offset
       for (int i = 0; i < FILTER_SIZE; i++) {
         _adcBuffer[i] = _tareOffset;
@@ -364,10 +411,16 @@ public:
       _bufferIndex = 0;
       _bufferFull = true;
       _latestFilteredADC = _tareOffset;
-      _filteredWeight = 0.0f;
+      _filteredADC = (float)_tareOffset;
       _lockedWeight = 0.0f;
       _isStable = true;
-      _stableFrames = 15;
+      _stableFrames = STABILITY_CONFIRM_FRAMES;
+
+      for (int i = 0; i < STABILITY_WINDOW_SIZE; i++) {
+        _stabilityBuffer[i] = _filteredADC;
+      }
+      _stabilityIndex = 0;
+      _stabilityFilled = true;
 
       // Notice: Operational tare is kept in RAM to protect flash sectors from wear
       Serial.printf("[SUCCESS] Tare locked. Offset = %ld (samples: %d)\n", (long)_tareOffset, validSamples);
@@ -427,6 +480,9 @@ public:
       _isCalibrated = true;
       _scale.setScaleFactor(_scaleFactor);
 
+      // Reset auto-zero tracking correction
+      _autoZeroCorrection = 0.0f;
+
       // Flush buffer with new calibrated reference
       for (int i = 0; i < FILTER_SIZE; i++) {
         _adcBuffer[i] = avgVal;
@@ -434,10 +490,16 @@ public:
       _bufferIndex = 0;
       _bufferFull = true;
       _latestFilteredADC = avgVal;
-      _filteredWeight = knownWeight;
-      _lockedWeight = knownWeight;
+      _filteredADC = (float)avgVal;
+      _lockedWeight = (float)lround(knownWeight);
       _isStable = true;
-      _stableFrames = 15;
+      _stableFrames = STABILITY_CONFIRM_FRAMES;
+
+      for (int i = 0; i < STABILITY_WINDOW_SIZE; i++) {
+        _stabilityBuffer[i] = _filteredADC;
+      }
+      _stabilityIndex = 0;
+      _stabilityFilled = true;
 
       saveSettings();
       Serial.printf("[SUCCESS] Calibration complete! Factor: %.4f counts/g (Net: %ld)\n", _scaleFactor, (long)net);
@@ -540,8 +602,9 @@ public:
 
     // Instant redraw with new unit
     if (_display) {
-      float val = _isHeld ? _heldWeight : (_isStable ? _lockedWeight : _filteredWeight);
-      int32_t netCounts = _latestFilteredADC - _tareOffset;
+      int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
+      float currentVal = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
+      float val = _isHeld ? _heldWeight : currentVal;
       _display->showWeight(val, _currentUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, false);
     }
   }
@@ -645,8 +708,8 @@ public:
       sorted[j + 1] = key;
     }
 
-    // Drop 1 lowest and 1 highest (averages middle 6 of 8)
-    int drop = (count >= 6) ? 1 : 0;
+    // Discard outliers (drop 2 lowest & 2 highest for 16-sample buffer, else 1)
+    int drop = (count >= 12) ? 2 : ((count >= 6) ? 1 : 0);
     long sum = 0;
     int used = 0;
     for (int i = drop; i < count - drop; i++) {
@@ -673,6 +736,47 @@ public:
   }
 
 private:
+  void updateStability(float filteredADC) {
+    _stabilityBuffer[_stabilityIndex] = filteredADC;
+    _stabilityIndex = (_stabilityIndex + 1) % STABILITY_WINDOW_SIZE;
+    if (_stabilityIndex == 0) _stabilityFilled = true;
+
+    int count = _stabilityFilled ? STABILITY_WINDOW_SIZE : _stabilityIndex;
+    if (count >= 6) {
+      float minVal = _stabilityBuffer[0];
+      float maxVal = _stabilityBuffer[0];
+      for (int i = 1; i < count; i++) {
+        if (_stabilityBuffer[i] < minVal) minVal = _stabilityBuffer[i];
+        if (_stabilityBuffer[i] > maxVal) maxVal = _stabilityBuffer[i];
+      }
+      float spread = maxVal - minVal;
+
+      if (spread <= (float)STABILITY_SPREAD_COUNTS) {
+        if (_stableFrames < STABILITY_CONFIRM_FRAMES) _stableFrames++;
+        if (_stableFrames >= STABILITY_CONFIRM_FRAMES) {
+          _isStable = true;
+        }
+      } else {
+        _stableFrames = 0;
+        _isStable = false;
+      }
+    }
+  }
+
+  void updateAutoZero() {
+    // Rate-limited Auto-Zero Tracking (OIML R76 §4.5.7) operating in native ADC counts
+    // Operates only when scale is stable and net counts are within the auto-zero window
+    float net = _filteredADC - (float)_tareOffset - _autoZeroCorrection;
+    if (_isStable && fabsf(net) <= (float)AUTO_ZERO_BAND_COUNTS) {
+      float step = net * 0.10f;
+      float maxStep = (float)AUTO_ZERO_MAX_STEP_COUNTS;
+      if (step > maxStep) step = maxStep;
+      if (step < -maxStep) step = -maxStep;
+
+      _autoZeroCorrection += step;
+    }
+  }
+
   void updatePowerBankPulse() {
 #ifdef POWER_BANK_PULSE_PIN
     unsigned long now = millis();
@@ -852,9 +956,9 @@ private:
         Serial.printf("[INFO] Manual ScaleFactor set to: %.4f\n", _scaleFactor);
       }
     } else if (cmd.equalsIgnoreCase("r") || cmd.equalsIgnoreCase("raw")) {
-      int32_t rawVal = getTrimmedMeanADC();
-      Serial.printf("[RAW] FilteredADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n",
-                    (long)rawVal, (long)_tareOffset, (long)(rawVal - _tareOffset), _scaleFactor);
+      int32_t trimmedVal = getTrimmedMeanADC();
+      Serial.printf("[RAW] RawADC: %ld | TrimmedADC: %ld | TareOffset: %ld | Net: %ld | ScaleFactor: %.4f\n",
+                    (long)_rawADC, (long)trimmedVal, (long)_tareOffset, (long)(trimmedVal - _tareOffset), _scaleFactor);
     } else if (cmd.equalsIgnoreCase("h") || cmd.equalsIgnoreCase("help")) {
       printHelp();
     }
