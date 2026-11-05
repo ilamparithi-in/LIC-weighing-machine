@@ -21,10 +21,19 @@
 #define HOLD_BUTTON_PIN      1     // Dedicated Hold Button (GPIO 1, active LOW)
 #define TARE_BUTTON_PIN      0     // Dedicated Tare Button (GPIO 0, active LOW / pull to GND)
 #define UNIT_BUTTON_PIN      6     // Dedicated Unit Change Button (GPIO 6, active LOW / pull to GND)
+#define PCS_BUTTON_PIN       5     // Dedicated PCS Counting Button (GPIO 5, active LOW / pull to GND)
 #define POWER_BANK_PULSE_PIN 7     // Pulse pin to keep IP5306 power bank alive (pull to GND every 10s)
 
+// ---------------------- 4-BUTTON ARROW NAVIGATION MAPPING ----
+// Physical layout Left-to-Right: GPIO 1 -> 0 -> 6 -> 5
+// Momentarily re-bound during modal screens (e.g. PCS Sample Wizard):
+#define NAV_BTN_CANCEL       HOLD_BUTTON_PIN  // [ESC / Cancel / Back] (Leftmost - GPIO 1)
+#define NAV_BTN_DEC          TARE_BUTTON_PIN  // [- / Previous]        (Middle-Left - GPIO 0)
+#define NAV_BTN_INC          UNIT_BUTTON_PIN  // [+ / Next]            (Middle-Right - GPIO 6)
+#define NAV_BTN_CONFIRM      PCS_BUTTON_PIN   // [OK / Set / Confirm]  (Rightmost - GPIO 5)
+
 // Power On/Off Long-Press Assignment:
-// Assignable to any button (HOLD_BUTTON_PIN, TARE_BUTTON_PIN, or UNIT_BUTTON_PIN).
+// Assignable to any button (HOLD_BUTTON_PIN, TARE_BUTTON_PIN, UNIT_BUTTON_PIN, or PCS_BUTTON_PIN).
 // Long-pressing (>= 1.5s) this button enters sleep/power off; wakes up on button press.
 #define POWER_OFF_BUTTON_PIN HOLD_BUTTON_PIN
 
@@ -72,3 +81,11 @@
 #define DEFAULT_SCALE_FACTOR     93.44f  // Default counts per gram
 #define DEFAULT_TARE_OFFSET      81628   // Default tare offset
 #define PREFS_NAMESPACE          "scale_cfg"
+
+// ---------------------- PCS COUNTING CONFIGURATION -----------
+#define PCS_SETUP_HOLD_MS            1000    // Long press on PCS button to enter wizard (1.0 second)
+#define SAMPLE_SETUP_TIMEOUT_MS      -1      // Wizard inactivity timeout in ms (set <= 0 to disable)
+#define DEFAULT_SAMPLE_COUNT         10      // Default sampling count
+#define MIN_SAMPLE_TOTAL_WEIGHT_G    0.20f   // Minimum total sample weight required to teach APW
+#define MIN_PIECE_WEIGHT_G           0.005f  // Minimum piece weight allowed (~5mg resolution)
+

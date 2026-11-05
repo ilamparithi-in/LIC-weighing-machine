@@ -32,6 +32,13 @@ public:
     (void)maxHoldMs;
   }
 
+  // Modal PCS sample setup wizard display (Arrow Interface)
+  virtual void showSampleWizard(uint16_t sampleCount, float currentWeight, const char* promptMsg = nullptr) {
+    (void)sampleCount;
+    (void)currentWeight;
+    (void)promptMsg;
+  }
+
   // Graceful shutdown screen & hardware sleep
   virtual void showPowerOff() = 0;
   virtual void powerDown() = 0;

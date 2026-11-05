@@ -17,9 +17,10 @@ Both the **7Semi NAU7802** and the chosen display share the I2C bus on the ESP32
 | **GND** | **GND** | **GND** | **GND** | Common Ground |
 | **GPIO 3** | **SDA** | **SDA** | **SDA** | I2C Data line |
 | **GPIO 4** | **SCL** | **SCL** | **SCL** | I2C Clock line |
-| **GPIO 1** | - | - | - | **Dedicated HOLD Button**:<br>- Short Press: Toggle HOLD on/off<br>- Hold 1.5s: Enter Sleep (Power Off, configurable in config.h)<br>- Press while Off: Wake up |
-| **GPIO 0** | - | - | - | **Dedicated TARE Button** (Pull to GND to Zero) |
-| **GPIO 6** | - | - | - | **Dedicated UNIT Button** (Cycle g/kg/oz/lb) |
+| **GPIO 1** | - | - | - | **Dedicated HOLD Button** (Leftmost):<br>- Short Press: Toggle HOLD on/off<br>- Hold 1.5s: Enter Sleep (Power Off, configurable in config.h)<br>- Press while Off: Wake up<br>- In Sample Wizard: **`[ESC]`** Cancel / Exit |
+| **GPIO 0** | - | - | - | **Dedicated TARE Button** (Middle-Left):<br>- Short Press: Zero / Tare scale<br>- In Sample Wizard: **`[-]`** Decrement sample count |
+| **GPIO 6** | - | - | - | **Dedicated UNIT Button** (Middle-Right):<br>- Short Press: Cycle weight unit (g/kg/oz/lb)<br>- In Sample Wizard: **`[+]`** Increment sample count |
+| **GPIO 5** | - | - | - | **Dedicated PCS Button** (Rightmost):<br>- Short Press: Toggle Weighing $\leftrightarrow$ PCS Counting mode<br>- Hold 1.0s: Open Sample Calibration Wizard<br>- In Sample Wizard: **`[OK]`** Confirm reference sample & save APW |
 | **GPIO 7** | - | - | - | **Power Bank Keep-Alive** (Pulses IP5306 keypad every 10s) |
 
 > **I2C Addresses**:
@@ -84,8 +85,15 @@ In [weighingmachine/config.h](file:///home/ilam_common/DevHome/GitHub/weighingma
   * Hysteresis locking: 1g integer resolution lock with 0.8g hysteresis band to eliminate digit jitter.
   * Zero-tracking deadband: Automatically snaps to exact 0 within ±1.0g.
 * **Instant Unit Cycling**: Dedicated button on GPIO 6 cycles through `g` -> `kg` -> `oz` -> `lb` instantaneously with zero screen flicker or lag.
+* **PCS (Piece Counting System)**:
+  * Dedicated button on GPIO 5 toggles instantly between standard weighing and piece counting mode.
+  * Long-pressing GPIO 5 (>= 1.0s) triggers an interactive **Reference Sample Wizard** with continuously variable sample count (1 to 9999 pcs).
+  * Smooth auto-repeat with 4-stage adaptive acceleration curve on long-press for rapid, precise value adjustments.
+  * Momentarily rebinds the 4 physical buttons (left-to-right GPIO 1, 0, 6, 5) to an arrow navigation interface (`[ESC]`, `[-]`, `[+]`, `[OK]`).
+  * Validates minimum total sample weight (>= 0.20g) and piece resolution (>= 0.005g) to prevent inaccurate piece counting.
+  * Optimized display formatting for both 0.91" 128x32 OLED (large Size 3 digits with fixed right `pcs` badge) and 16x2 LCD (`Qty: <count> pcs`).
 * **Quadratic Tare Animation**: Pressing Tare on GPIO 0 or via Serial animates the live reading gracefully falling to 0 with quadratic deceleration (`remain * remain`). Routine zeroing is kept in RAM to protect flash memory from sector wear.
-* **Non-Volatile Calibration**: Calibration scale factor, zero offset, and active unit are saved to ESP32 Flash memory via `Preferences` during calibration and restored on boot.
+* **Non-Volatile Calibration & APW Storage**: Calibration scale factor, zero offset, active unit, average piece weight (APW), reference sample count, and operating mode are persisted in ESP32 Flash memory via `Preferences` and restored on boot.
 * **Ultra-Low Power Sleep**: Dedicated power button (GPIO 1 by default, assignable in `config.h`) long-press (1.5s) enters light sleep (~0.13mA). Auto-shutdown automatically turns off the scale after 2 minutes of inactivity (can be disabled in `config.h`). Pressing any button wakes the system back up instantly.
 
 ---
@@ -110,7 +118,11 @@ In [weighingmachine/config.h](file:///home/ilam_common/DevHome/GitHub/weighingma
 | :--- | :--- | :--- |
 | `t` or `tare` | None | Zero (Tare) the scale |
 | `u` or `unit` | None | Cycle active unit (`g` -> `kg` -> `oz` -> `lb`) |
-| `hold` | None | Freeze / unfreeze live weight display |
+| `pcs` | None | Toggle / enter PCS piece counting mode |
+| `sample <count>` | Integer | Calibrate APW with current load as `<count>` pieces (e.g., `sample 25`) |
+| `apw <weight>` | Float (g) | Manually set Average Piece Weight in grams (e.g., `apw 0.254`) |
+| `apw` | None | Query current APW, reference sample, and piece count diagnostics |
+| `hold` | None | Freeze / unfreeze live weight or piece count display |
 | `off` or `sleep` | None | Enter ultra-low power sleep |
 | `c <weight>` | Float (g) | Calibrate scale with reference weight (e.g., `c 500`) |
 | `cp <weight>`| Float (g) | Calibration preview (calculate scale factor without saving) |

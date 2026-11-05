@@ -169,6 +169,43 @@ public:
     }
   }
 
+  virtual void showSampleWizard(uint16_t sampleCount, float currentWeight, const char* promptMsg = nullptr) override {
+    _display.clearDisplay();
+
+    // 1. Top Inverted Header Bar: "SAMPLE: 25 PCS"
+    _display.fillRect(0, 0, 128, 9, SSD1306_WHITE);
+    _display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    _display.setTextSize(1);
+    _display.setCursor(6, 1);
+    char titleBuf[24];
+    snprintf(titleBuf, sizeof(titleBuf), "SAMPLE: %u PCS", sampleCount);
+    _display.print(titleBuf);
+
+    // 2. Middle Prompt / Load Line
+    _display.setTextColor(SSD1306_WHITE);
+    _display.setCursor(2, 11);
+    if (promptMsg != nullptr && strlen(promptMsg) > 0) {
+      _display.print(promptMsg);
+    } else {
+      char loadBuf[24];
+      snprintf(loadBuf, sizeof(loadBuf), "Load: %.2fg  [SET]", currentWeight);
+      _display.print(loadBuf);
+    }
+
+    // 3. Separator line and 4-Button Navigation Bar (GPIO 1, 0, 6, 5)
+    _display.drawFastHLine(0, 21, 128, SSD1306_WHITE);
+    _display.setCursor(2, 23);
+    _display.print("ESC");
+    _display.setCursor(42, 23);
+    _display.print("-");
+    _display.setCursor(78, 23);
+    _display.print("+");
+    _display.setCursor(110, 23);
+    _display.print("OK");
+
+    _display.display();
+  }
+
   virtual void showPowerOff() override {
     showStatus("POWER OFF", "Goodbye!", 800);
   }

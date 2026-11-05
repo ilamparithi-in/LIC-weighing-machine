@@ -30,6 +30,15 @@ private:
   bool _isCalibrated;
   WeightUnit _currentUnit;
 
+  // Operating Mode & PCS (Piece Counting) State
+  ScaleOperatingMode _operatingMode;
+  float _pieceWeight;              // Average Piece Weight (APW) in grams
+  uint16_t _sampleCount;           // Current sample count (continuously variable 1..9999)
+  bool _inSampleWizard;            // True when 4-button arrow interface is modal
+  unsigned long _wizardStartTime;  // Inactivity timer for sample wizard
+  unsigned long _incLastRepeatTime;// Last auto-repeat step timestamp for increment
+  unsigned long _decLastRepeatTime;// Last auto-repeat step timestamp for decrement
+
   // Digital Filtering & Rolling Buffer (operating directly in native ADC counts)
   int32_t _adcBuffer[FILTER_SIZE];
   int _bufferIndex;
@@ -60,7 +69,9 @@ private:
   unsigned long _holdPressStartTime;
   unsigned long _tarePressStartTime;
   unsigned long _unitPressStartTime;
+  unsigned long _pcsPressStartTime;
   bool _powerOffTriggered;
+  bool _pcsLongPressTriggered;
   unsigned long _lastCountdownUpdate;
   bool _isShutdownCountdownActive;
 
@@ -80,6 +91,13 @@ public:
       _tareOffset(DEFAULT_TARE_OFFSET),
       _isCalibrated(true),
       _currentUnit(UNIT_G),
+      _operatingMode(MODE_WEIGHING),
+      _pieceWeight(0.0f),
+      _sampleCount(DEFAULT_SAMPLE_COUNT),
+      _inSampleWizard(false),
+      _wizardStartTime(0),
+      _incLastRepeatTime(0),
+      _decLastRepeatTime(0),
       _bufferIndex(0),
       _bufferFull(false),
       _rawADC(0),
@@ -99,7 +117,9 @@ public:
       _holdPressStartTime(0),
       _tarePressStartTime(0),
       _unitPressStartTime(0),
+      _pcsPressStartTime(0),
       _powerOffTriggered(false),
+      _pcsLongPressTriggered(false),
       _lastCountdownUpdate(0),
       _isShutdownCountdownActive(false),
       _lastPowerPulseTime(0),
@@ -129,6 +149,7 @@ public:
     pinMode(HOLD_BUTTON_PIN, INPUT_PULLUP);
     pinMode(TARE_BUTTON_PIN, INPUT_PULLUP);
     pinMode(UNIT_BUTTON_PIN, INPUT_PULLUP);
+    pinMode(PCS_BUTTON_PIN, INPUT_PULLUP);
 
 #ifdef POWER_BANK_PULSE_PIN
     // 3b. Configure Power Bank keep-alive pulse pin (default high-Z input)
@@ -141,7 +162,8 @@ public:
 
     // If woken from sleep while any button is held, wait for release
     unsigned long releaseStart = millis();
-    while ((digitalRead(HOLD_BUTTON_PIN) == LOW || digitalRead(TARE_BUTTON_PIN) == LOW || digitalRead(UNIT_BUTTON_PIN) == LOW) && (millis() - releaseStart < 1500)) {
+    while ((digitalRead(HOLD_BUTTON_PIN) == LOW || digitalRead(TARE_BUTTON_PIN) == LOW ||
+            digitalRead(UNIT_BUTTON_PIN) == LOW || digitalRead(PCS_BUTTON_PIN) == LOW) && (millis() - releaseStart < 1500)) {
       delay(10);
     }
     delay(50);
@@ -309,27 +331,66 @@ public:
     }
 
     // 5. Refresh display and serial output at 100ms intervals (10 Hz)
+    // If modal sample wizard is active, render wizard UI
+    if (_inSampleWizard) {
+      if (millis() - _lastDisplayUpdate >= DISPLAY_INTERVAL_MS) {
+        _lastDisplayUpdate = millis();
+        if (SAMPLE_SETUP_TIMEOUT_MS > 0 && (millis() - _wizardStartTime >= (unsigned long)SAMPLE_SETUP_TIMEOUT_MS)) {
+          Serial.println("[WIZARD] Inactivity timeout. Exiting wizard...");
+          exitSampleWizard(false);
+          return;
+        }
+        int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
+        float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+        if (_display) {
+          _display->showSampleWizard(_sampleCount, netGrams, nullptr);
+        }
+      }
+      return;
+    }
+
     // Suppress regular weight update if shutdown countdown is actively rendering
     if (!_isShutdownCountdownActive && (millis() - _lastDisplayUpdate >= DISPLAY_INTERVAL_MS)) {
       _lastDisplayUpdate = millis();
 
       int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
       bool saturated = (_latestFilteredADC <= -ADC_SATURATION_LIMIT || _latestFilteredADC >= ADC_SATURATION_LIMIT);
-      float liveValue = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
-      float displayValue = _isHeld ? _heldWeight : liveValue;
+
+      WeightUnit activeUnit;
+      float displayValue;
+
+      if (_operatingMode == MODE_PCS) {
+        activeUnit = UNIT_PCS;
+        float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+        float count = (_pieceWeight > 0.0001f) ? (netGrams / _pieceWeight) : 0.0f;
+        float livePcs = (_lockedWeight == 0.0f) ? 0.0f : (float)lround(count);
+        displayValue = _isHeld ? _heldWeight : livePcs;
+      } else {
+        activeUnit = _currentUnit;
+        float liveValue = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
+        displayValue = _isHeld ? _heldWeight : liveValue;
+      }
 
       if (_display) {
-        _display->showWeight(displayValue, _currentUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, saturated);
+        _display->showWeight(displayValue, activeUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, saturated);
       }
 
       // Stream to serial monitor if buffer space available
       if (Serial.availableForWrite() >= 64) {
         char serWeightBuf[20];
-        formatWeightString(displayValue, _currentUnit, serWeightBuf, sizeof(serWeightBuf));
-        Serial.printf("Weight: %s | Raw: %ld | Net: %ld | %s%s\n",
-                      serWeightBuf, (long)_rawADC, (long)netCounts,
-                      _isHeld ? "[HOLD] " : "",
-                      _isStable ? "[STABLE]" : "[MOVING]");
+        formatWeightString(displayValue, activeUnit, serWeightBuf, sizeof(serWeightBuf));
+        if (_operatingMode == MODE_PCS) {
+          float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+          Serial.printf("PCS: %s | Wt: %.2fg | APW: %.4fg | %s%s\n",
+                        serWeightBuf, netGrams, _pieceWeight,
+                        _isHeld ? "[HOLD] " : "",
+                        _isStable ? "[STABLE]" : "[MOVING]");
+        } else {
+          Serial.printf("Weight: %s | Raw: %ld | Net: %ld | %s%s\n",
+                        serWeightBuf, (long)_rawADC, (long)netCounts,
+                        _isHeld ? "[HOLD] " : "",
+                        _isStable ? "[STABLE]" : "[MOVING]");
+        }
       }
     }
   }
@@ -337,16 +398,32 @@ public:
   void toggleHold() {
     _isHeld = !_isHeld;
     int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
-    float currentVal = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
+    WeightUnit activeUnit;
+    float currentVal;
+
+    if (_operatingMode == MODE_PCS) {
+      activeUnit = UNIT_PCS;
+      float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+      float count = (_pieceWeight > 0.0001f) ? (netGrams / _pieceWeight) : 0.0f;
+      currentVal = (_lockedWeight == 0.0f) ? 0.0f : (float)lround(count);
+    } else {
+      activeUnit = _currentUnit;
+      currentVal = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
+    }
+
     if (_isHeld) {
       _heldWeight = currentVal;
-      Serial.printf("[HOLD] Weight held at: %.1f g\n", _heldWeight);
+      if (_operatingMode == MODE_PCS) {
+        Serial.printf("[HOLD] Piece count held at: %ld pcs\n", lround(_heldWeight));
+      } else {
+        Serial.printf("[HOLD] Weight held at: %.3f %s\n", _heldWeight, getUnitSymbol(activeUnit));
+      }
     } else {
       Serial.println("[HOLD] Weight released (live stream resumed).");
     }
     if (_display) {
       float val = _isHeld ? _heldWeight : currentVal;
-      _display->showWeight(val, _currentUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, false);
+      _display->showWeight(val, activeUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, false);
     }
   }
 
@@ -593,12 +670,18 @@ public:
   }
 
   void cycleUnit() {
-    _currentUnit = (WeightUnit)((_currentUnit + 1) % 4);
-    const char* uSym = getUnitSymbol(_currentUnit);
-    const char* uName = getUnitName(_currentUnit);
-
-    Serial.printf("[UNIT] Unit changed to: %s (%s)\n", uSym, uName);
-    saveSettings();
+    if (_inSampleWizard) return;
+    if (_operatingMode == MODE_PCS) {
+      _operatingMode = MODE_WEIGHING;
+      Serial.printf("[UNIT] Exited PCS mode. Returned to weighing (%s)\n", getUnitSymbol(_currentUnit));
+      saveSettings();
+    } else {
+      _currentUnit = (WeightUnit)((_currentUnit + 1) % 4);
+      const char* uSym = getUnitSymbol(_currentUnit);
+      const char* uName = getUnitName(_currentUnit);
+      Serial.printf("[UNIT] Unit changed to: %s (%s)\n", uSym, uName);
+      saveSettings();
+    }
 
     // Instant redraw with new unit
     if (_display) {
@@ -606,6 +689,163 @@ public:
       float currentVal = (_currentUnit == UNIT_G) ? _lockedWeight : (_isStable ? _lockedWeight : ((_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f));
       float val = _isHeld ? _heldWeight : currentVal;
       _display->showWeight(val, _currentUnit, _isStable, _isHeld, netCounts, _latestFilteredADC, false);
+    }
+  }
+
+  void togglePcsMode() {
+    if (_inSampleWizard) return;
+    if (_operatingMode == MODE_WEIGHING) {
+      if (_pieceWeight <= 0.0001f) {
+        Serial.println("[PCS] No APW calibrated yet. Entering Sample Wizard...");
+        startSampleWizard();
+      } else {
+        _operatingMode = MODE_PCS;
+        Serial.printf("[PCS] Activated Piece Counting. APW = %.4fg | SampleRef = %u pcs\n", _pieceWeight, _sampleCount);
+        saveSettings();
+        if (_display) {
+          char apwBuf[22];
+          snprintf(apwBuf, sizeof(apwBuf), "APW: %.3fg", _pieceWeight);
+          _display->showStatus("PCS MODE", apwBuf, 800);
+        }
+      }
+    } else {
+      _operatingMode = MODE_WEIGHING;
+      Serial.printf("[PCS] Returned to standard weighing mode (%s).\n", getUnitSymbol(_currentUnit));
+      saveSettings();
+      if (_display) {
+        char unitBuf[22];
+        snprintf(unitBuf, sizeof(unitBuf), "Unit: %s", getUnitSymbol(_currentUnit));
+        _display->showStatus("WEIGH MODE", unitBuf, 800);
+      }
+    }
+  }
+
+  void updateWizardDisplay() {
+    if (_display) {
+      int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
+      float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+      _display->showSampleWizard(_sampleCount, netGrams, nullptr);
+    }
+  }
+
+  void startSampleWizard() {
+    _inSampleWizard = true;
+    _wizardStartTime = millis();
+    if (_sampleCount == 0) _sampleCount = DEFAULT_SAMPLE_COUNT;
+
+    Serial.printf("[WIZARD] Started Sample Wizard. Target: %u pcs (continuously variable 1..9999).\n", _sampleCount);
+    Serial.printf("[WIZARD] 4-Button Controls: [ESC: GPIO %d] [-: GPIO %d] [+: GPIO %d] [OK: GPIO %d]\n",
+                  NAV_BTN_CANCEL, NAV_BTN_DEC, NAV_BTN_INC, NAV_BTN_CONFIRM);
+
+    updateWizardDisplay();
+  }
+
+  void exitSampleWizard(bool success) {
+    _inSampleWizard = false;
+    if (!success && _operatingMode == MODE_PCS && _pieceWeight <= 0.0001f) {
+      _operatingMode = MODE_WEIGHING;
+    }
+  }
+
+  bool calibratePcsWithSample(uint16_t count) {
+    if (count == 0) count = DEFAULT_SAMPLE_COUNT;
+    Serial.printf("[ACTION] Calibrating APW with %u reference pieces...\n", count);
+    if (_display) {
+      char refBuf[22];
+      snprintf(refBuf, sizeof(refBuf), "Ref: %u pcs", count);
+      _display->showStatus("SAMPLING...", refBuf);
+    }
+
+    const int CAL_SAMPLES = 20;
+    int32_t samples[CAL_SAMPLES];
+    int validSamples = 0;
+    unsigned long start = millis();
+    while (validSamples < CAL_SAMPLES && (millis() - start < 2000)) {
+      int32_t val;
+      if (_scale.readRaw(val, 80)) {
+        samples[validSamples++] = val;
+      }
+      delay(10);
+    }
+
+    if (validSamples >= 10) {
+      // Sort and calculate trimmed mean
+      for (int i = 1; i < validSamples; i++) {
+        int32_t key = samples[i];
+        int j = i - 1;
+        while (j >= 0 && samples[j] > key) {
+          samples[j + 1] = samples[j];
+          j--;
+        }
+        samples[j + 1] = key;
+      }
+      int drop = validSamples / 5;
+      long sum = 0;
+      int used = 0;
+      for (int i = drop; i < validSamples - drop; i++) {
+        sum += samples[i];
+        used++;
+      }
+      int32_t avgVal = (used > 0) ? (sum / used) : samples[validSamples / 2];
+      int32_t netCounts = avgVal - _tareOffset;
+      float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+
+      if (netGrams < MIN_SAMPLE_TOTAL_WEIGHT_G) {
+        Serial.printf("[ERROR] Sample total weight too small (%.2fg < %.2fg required)!\n",
+                      netGrams, MIN_SAMPLE_TOTAL_WEIGHT_G);
+        if (_display) {
+          _display->showStatus("TOO LIGHT!", "Need > 0.20g", 1500);
+        }
+        return false;
+      }
+
+      float calculatedApw = netGrams / (float)count;
+      if (calculatedApw < MIN_PIECE_WEIGHT_G) {
+        Serial.printf("[ERROR] Piece weight too small (%.4fg < %.4fg required)!\n",
+                      calculatedApw, MIN_PIECE_WEIGHT_G);
+        if (_display) {
+          _display->showStatus("APW TOO SMALL!", "Check weight", 1500);
+        }
+        return false;
+      }
+
+      _pieceWeight = calculatedApw;
+      _sampleCount = count;
+      _operatingMode = MODE_PCS;
+      _inSampleWizard = false;
+      saveSettings();
+
+      Serial.printf("[SUCCESS] APW set to %.4f g/pc (Total weight: %.2fg for %u pcs)\n",
+                    _pieceWeight, netGrams, _sampleCount);
+      char apwBuf[22];
+      snprintf(apwBuf, sizeof(apwBuf), "APW: %.3fg", _pieceWeight);
+      if (_display) {
+        _display->showStatus("APW SAVED!", apwBuf, 1200);
+      }
+      return true;
+    } else {
+      Serial.println("[ERROR] Sampling failed. ADC timeout or unstable readings.");
+      if (_display) {
+        _display->showStatus("SAMPLE FAILED!", "Check weight", 1200);
+      }
+      return false;
+    }
+  }
+
+  void setManualAPW(float apw) {
+    if (apw < MIN_PIECE_WEIGHT_G) {
+      Serial.printf("[ERROR] APW must be >= %.4fg\n", MIN_PIECE_WEIGHT_G);
+      return;
+    }
+    _pieceWeight = apw;
+    _operatingMode = MODE_PCS;
+    _inSampleWizard = false;
+    saveSettings();
+    Serial.printf("[SUCCESS] Manual APW set to: %.4f g/pc. PCS mode active.\n", _pieceWeight);
+    char apwBuf[22];
+    snprintf(apwBuf, sizeof(apwBuf), "APW: %.3fg", _pieceWeight);
+    if (_display) {
+      _display->showStatus("APW SET!", apwBuf, 1000);
     }
   }
 
@@ -627,11 +867,16 @@ public:
     gpio_pulldown_dis((gpio_num_t)HOLD_BUTTON_PIN);
     gpio_pullup_en((gpio_num_t)TARE_BUTTON_PIN);
     gpio_pulldown_dis((gpio_num_t)TARE_BUTTON_PIN);
+    gpio_pullup_en((gpio_num_t)UNIT_BUTTON_PIN);
+    gpio_pulldown_dis((gpio_num_t)UNIT_BUTTON_PIN);
+    gpio_pullup_en((gpio_num_t)PCS_BUTTON_PIN);
+    gpio_pulldown_dis((gpio_num_t)PCS_BUTTON_PIN);
 
     // Configure wake-up source on active buttons
     gpio_wakeup_enable((gpio_num_t)HOLD_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
     gpio_wakeup_enable((gpio_num_t)TARE_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
     gpio_wakeup_enable((gpio_num_t)UNIT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable((gpio_num_t)PCS_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
 
     Serial.flush();
@@ -642,7 +887,8 @@ public:
 
     // On wake: wait for button release
     unsigned long wakeWaitStart = millis();
-    while ((digitalRead(HOLD_BUTTON_PIN) == LOW || digitalRead(TARE_BUTTON_PIN) == LOW || digitalRead(UNIT_BUTTON_PIN) == LOW) && (millis() - wakeWaitStart < 1500)) {
+    while ((digitalRead(HOLD_BUTTON_PIN) == LOW || digitalRead(TARE_BUTTON_PIN) == LOW ||
+            digitalRead(UNIT_BUTTON_PIN) == LOW || digitalRead(PCS_BUTTON_PIN) == LOW) && (millis() - wakeWaitStart < 1500)) {
       delay(10);
     }
     delay(50);
@@ -661,6 +907,10 @@ public:
     _tareOffset = _prefs.getInt("tare_offset", DEFAULT_TARE_OFFSET);
     _isCalibrated = _prefs.getBool("calibrated", true);
     _currentUnit = (WeightUnit)_prefs.getUChar("unit", (uint8_t)UNIT_G);
+    _pieceWeight = _prefs.getFloat("piece_wt", 0.0f);
+    _sampleCount = _prefs.getUShort("sample_cnt", DEFAULT_SAMPLE_COUNT);
+    uint8_t opMode = _prefs.getUChar("mode", (uint8_t)MODE_WEIGHING);
+    _operatingMode = (opMode == (uint8_t)MODE_PCS && _pieceWeight > 0.0001f) ? MODE_PCS : MODE_WEIGHING;
     _prefs.end();
 
     if (_scaleFactor <= 0.1f) _scaleFactor = DEFAULT_SCALE_FACTOR;
@@ -671,8 +921,10 @@ public:
       _scale.setTareOffset(_tareOffset);
     }
 
-    Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Unit: %s | Calibrated: %s\n",
-                  _scaleFactor, (long)_tareOffset, getUnitSymbol(_currentUnit), _isCalibrated ? "YES" : "NO");
+    Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Unit: %s | Mode: %s | APW: %.4fg (Ref: %u pcs) | Calibrated: %s\n",
+                  _scaleFactor, (long)_tareOffset, getUnitSymbol(_currentUnit),
+                  (_operatingMode == MODE_PCS) ? "PCS" : "WEIGH", _pieceWeight, _sampleCount,
+                  _isCalibrated ? "YES" : "NO");
   }
 
   void saveSettings() {
@@ -681,6 +933,9 @@ public:
     _prefs.putInt("tare_offset", _tareOffset);
     _prefs.putBool("calibrated", _isCalibrated);
     _prefs.putUChar("unit", (uint8_t)_currentUnit);
+    _prefs.putFloat("piece_wt", _pieceWeight);
+    _prefs.putUShort("sample_cnt", _sampleCount);
+    _prefs.putUChar("mode", (uint8_t)_operatingMode);
     _prefs.end();
     Serial.println("[CONFIG] Saved settings to Non-Volatile Flash.");
   }
@@ -724,6 +979,10 @@ public:
     Serial.println("--- SERIAL COMMANDS ---");
     Serial.println("  t              : Tare (zero) scale");
     Serial.println("  u              : Cycle unit (g -> kg -> oz -> lb)");
+    Serial.println("  pcs            : Toggle / switch to PCS piece counting mode");
+    Serial.println("  sample <count> : Calibrate APW with current load as <count> pieces (e.g. 'sample 25')");
+    Serial.println("  apw <weight>   : Manually set Average Piece Weight in grams (e.g. 'apw 0.254')");
+    Serial.println("  apw            : Query current APW and piece counting status");
     Serial.println("  hold           : Toggle weight HOLD freeze");
     Serial.println("  off / sleep    : Enter ultra-low power sleep");
     Serial.println("  c <weight>     : Calibrate with known weight (e.g., 'c 608')");
@@ -864,6 +1123,172 @@ private:
     } else if (pin == UNIT_BUTTON_PIN) {
       Serial.println("[BUTTON] Unit cycle requested via button click.");
       cycleUnit();
+    } else if (pin == PCS_BUTTON_PIN) {
+      Serial.println("[BUTTON] PCS mode toggle requested via button click.");
+      togglePcsMode();
+    }
+  }
+
+  void handleWizardButton(uint8_t pin) {
+    _wizardStartTime = millis();
+    resetActivityTimer();
+
+    if (pin == NAV_BTN_CANCEL) {
+      Serial.println("[WIZARD] Cancel requested (ESC). Exiting wizard.");
+      exitSampleWizard(false);
+      if (_display) {
+        _display->showStatus("CANCELLED", nullptr, 600);
+      }
+    } else if (pin == NAV_BTN_CONFIRM) {
+      Serial.printf("[WIZARD] Confirming reference sample for %u pcs...\n", _sampleCount);
+      calibratePcsWithSample(_sampleCount);
+    }
+  }
+
+  void processWizardContinuousNav() {
+    unsigned long now = millis();
+
+    // --- 1. Increment Button (NAV_BTN_INC, GPIO 6) ---
+    if (digitalRead(NAV_BTN_INC) == LOW) {
+      resetActivityTimer();
+      _wizardStartTime = now;
+      if (_unitPressStartTime == 0) {
+        // Initial Press: instantaneous +1 step
+        _unitPressStartTime = now;
+        _incLastRepeatTime = now;
+        if (_sampleCount < 9999) _sampleCount++;
+        Serial.printf("[WIZARD] Sample Count [+]: %u pcs\n", _sampleCount);
+        updateWizardDisplay();
+      } else {
+        // Continuously Held: Adaptive Acceleration Curve
+        unsigned long holdMs = now - _unitPressStartTime;
+        const unsigned long INITIAL_DWELL_MS = 400; // 400ms dwell before auto-repeat
+
+        if (holdMs >= INITIAL_DWELL_MS) {
+          uint16_t step = 1;
+          unsigned long interval = 130;
+
+          if (holdMs >= 5000) {
+            step = 50;
+            interval = 60;
+          } else if (holdMs >= 3000) {
+            step = 10;
+            interval = 70;
+          } else if (holdMs >= 1500) {
+            step = 2;
+            interval = 90;
+          } else {
+            step = 1;
+            interval = 130;
+          }
+
+          if (now - _incLastRepeatTime >= interval) {
+            _incLastRepeatTime = now;
+            if ((uint32_t)_sampleCount + step > 9999) {
+              _sampleCount = 9999;
+            } else {
+              _sampleCount += step;
+            }
+            updateWizardDisplay();
+          }
+        }
+      }
+    } else {
+      _unitPressStartTime = 0;
+    }
+
+    // --- 2. Decrement Button (NAV_BTN_DEC, GPIO 0) ---
+    if (digitalRead(NAV_BTN_DEC) == LOW) {
+      resetActivityTimer();
+      _wizardStartTime = now;
+      if (_tarePressStartTime == 0) {
+        // Initial Press: instantaneous -1 step
+        _tarePressStartTime = now;
+        _decLastRepeatTime = now;
+        if (_sampleCount > 1) _sampleCount--;
+        Serial.printf("[WIZARD] Sample Count [-]: %u pcs\n", _sampleCount);
+        updateWizardDisplay();
+      } else {
+        // Continuously Held: Adaptive Acceleration Curve
+        unsigned long holdMs = now - _tarePressStartTime;
+        const unsigned long INITIAL_DWELL_MS = 400; // 400ms dwell before auto-repeat
+
+        if (holdMs >= INITIAL_DWELL_MS) {
+          uint16_t step = 1;
+          unsigned long interval = 130;
+
+          if (holdMs >= 5000) {
+            step = 50;
+            interval = 60;
+          } else if (holdMs >= 3000) {
+            step = 10;
+            interval = 70;
+          } else if (holdMs >= 1500) {
+            step = 2;
+            interval = 90;
+          } else {
+            step = 1;
+            interval = 130;
+          }
+
+          if (now - _decLastRepeatTime >= interval) {
+            _decLastRepeatTime = now;
+            if (_sampleCount > step) {
+              _sampleCount -= step;
+            } else {
+              _sampleCount = 1;
+            }
+            updateWizardDisplay();
+          }
+        }
+      }
+    } else {
+      _tarePressStartTime = 0;
+    }
+  }
+
+  void checkWizardButton(uint8_t pin, unsigned long& pressStartTime) {
+    if (digitalRead(pin) == LOW) {
+      resetActivityTimer();
+      _wizardStartTime = millis();
+      if (pressStartTime == 0) {
+        pressStartTime = millis();
+      }
+    } else {
+      if (pressStartTime > 0) {
+        unsigned long duration = millis() - pressStartTime;
+        pressStartTime = 0;
+        if (duration >= 80) {
+          handleWizardButton(pin);
+        }
+      }
+    }
+  }
+
+  void checkPcsButton(uint8_t pin, unsigned long& pressStartTime) {
+    if (digitalRead(pin) == LOW) {
+      resetActivityTimer();
+      if (pressStartTime == 0) {
+        pressStartTime = millis();
+        _pcsLongPressTriggered = false;
+      } else {
+        unsigned long holdMs = millis() - pressStartTime;
+        if (holdMs >= PCS_SETUP_HOLD_MS && !_pcsLongPressTriggered) {
+          _pcsLongPressTriggered = true;
+          Serial.println("[BUTTON] PCS long-press detected (>=1.0s). Entering Sample Wizard...");
+          startSampleWizard();
+        }
+      }
+    } else {
+      if (pressStartTime > 0) {
+        unsigned long duration = millis() - pressStartTime;
+        pressStartTime = 0;
+        if (!_pcsLongPressTriggered && duration >= 80 && duration < PCS_SETUP_HOLD_MS) {
+          Serial.println("[BUTTON] PCS button click detected.");
+          togglePcsMode();
+        }
+        _pcsLongPressTriggered = false;
+      }
     }
   }
 
@@ -910,9 +1335,16 @@ private:
   }
 
   void checkButtons() {
-    checkSingleButton(HOLD_BUTTON_PIN, _holdPressStartTime);
-    checkSingleButton(TARE_BUTTON_PIN, _tarePressStartTime);
-    checkSingleButton(UNIT_BUTTON_PIN, _unitPressStartTime);
+    if (_inSampleWizard) {
+      processWizardContinuousNav();
+      checkWizardButton(NAV_BTN_CANCEL, _holdPressStartTime);
+      checkWizardButton(NAV_BTN_CONFIRM, _pcsPressStartTime);
+    } else {
+      checkSingleButton(HOLD_BUTTON_PIN, _holdPressStartTime);
+      checkSingleButton(TARE_BUTTON_PIN, _tarePressStartTime);
+      checkSingleButton(UNIT_BUTTON_PIN, _unitPressStartTime);
+      checkPcsButton(PCS_BUTTON_PIN, _pcsPressStartTime);
+    }
   }
 
   void handleSerialCommand(String cmd) {
@@ -923,6 +1355,34 @@ private:
       performTare();
     } else if (cmd.equalsIgnoreCase("u") || cmd.equalsIgnoreCase("unit")) {
       cycleUnit();
+    } else if (cmd.equalsIgnoreCase("pcs")) {
+      togglePcsMode();
+    } else if (cmd.startsWith("sample ") || cmd.startsWith("pcs sample ")) {
+      int spaceIdx = cmd.lastIndexOf(' ');
+      uint16_t cnt = cmd.substring(spaceIdx + 1).toInt();
+      if (cnt > 0) {
+        calibratePcsWithSample(cnt);
+      } else {
+        Serial.println("[ERROR] Enter valid sample count, e.g.: sample 25");
+      }
+    } else if (cmd.startsWith("apw ")) {
+      float apw = cmd.substring(4).toFloat();
+      if (apw > 0.0f) {
+        setManualAPW(apw);
+      } else {
+        Serial.println("[ERROR] Enter valid piece weight in grams, e.g.: apw 0.245");
+      }
+    } else if (cmd.equalsIgnoreCase("apw")) {
+      int32_t netCounts = (int32_t)(_filteredADC - (float)_tareOffset - _autoZeroCorrection);
+      float netGrams = (_scaleFactor != 0) ? ((float)netCounts / _scaleFactor) : 0.0f;
+      float count = (_pieceWeight > 0.0001f) ? (netGrams / _pieceWeight) : 0.0f;
+      Serial.println("--------------------------------------------------");
+      Serial.printf("  [APW] Active Mode:          %s\n", (_operatingMode == MODE_PCS) ? "PCS COUNTING" : "WEIGHING");
+      Serial.printf("  [APW] Piece Weight:         %.4f g/pc\n", _pieceWeight);
+      Serial.printf("  [APW] Reference Sample:     %u pcs\n", _sampleCount);
+      Serial.printf("  [APW] Current Net Weight:   %.2f g\n", netGrams);
+      Serial.printf("  [APW] Calculated Count:     %ld pcs (raw: %.2f)\n", lround(count), count);
+      Serial.println("--------------------------------------------------");
     } else if (cmd.equalsIgnoreCase("hold")) {
       toggleHold();
     } else if (cmd.equalsIgnoreCase("off") || cmd.equalsIgnoreCase("sleep")) {

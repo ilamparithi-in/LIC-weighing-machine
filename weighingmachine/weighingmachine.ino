@@ -15,7 +15,14 @@
  * - Pin 1 (HOLD_BUTTON_PIN) : Dedicated HOLD Button (Click = HOLD/UNHOLD, Default Hold 1.5s = SLEEP/WAKE)
  * - Pin 0 (TARE_BUTTON_PIN) : Dedicated TARE Button (Click = Zero)
  * - Pin 6 (UNIT_BUTTON_PIN) : Dedicated UNIT Button (Click = Cycle g -> kg -> oz -> lb)
+ * - Pin 5 (PCS_BUTTON_PIN)  : Dedicated PCS Button (Click = Toggle PCS/Weight, Hold 1.0s = Sample Wizard)
  * - Pin 7 (PULSE_PIN)       : IP5306 Power Bank Keep-Alive Pulse Pin
+ *
+ * 4-Button Navigation (Left-to-Right layout in Sample Wizard):
+ * - Pin 1: [ESC] Cancel / Exit
+ * - Pin 0: [-] Decrement Sample Count
+ * - Pin 6: [+] Increment Sample Count
+ * - Pin 5: [OK] Confirm & Save APW
  *
  * Load Cell (Standard 4-Wire) to 7Semi NAU7802:
  * --------------------------------------------------------------------

@@ -66,7 +66,8 @@ public:
     char weightBuf[16];
     formatWeightString(weight, unit, weightBuf, sizeof(weightBuf));
     char lineBuf[24];
-    snprintf(lineBuf, sizeof(lineBuf), "Wt:%-10s %c", weightBuf, isHeld ? 'H' : (_tick ? '*' : ' '));
+    const char* label = (unit == UNIT_PCS) ? "Qty" : "Wt";
+    snprintf(lineBuf, sizeof(lineBuf), "%s:%-10s %c", label, weightBuf, isHeld ? 'H' : (_tick ? '*' : ' '));
     lineBuf[16] = '\0'; // Guarantee 16 chars for 16x2 LCD
     _lcd->setCursor(0, 0);
     _lcd->print(lineBuf);
@@ -109,6 +110,25 @@ public:
       _lcd->setCursor(0, 1);
       _lcd->print(lineBuf);
     }
+  }
+
+  virtual void showSampleWizard(uint16_t sampleCount, float currentWeight, const char* promptMsg = nullptr) override {
+    if (!_lcd) return;
+    char line0[24];
+    char line1[24];
+    if (promptMsg != nullptr && strlen(promptMsg) > 0) {
+      snprintf(line0, sizeof(line0), "%-16.16s", promptMsg);
+      snprintf(line1, sizeof(line1), "ESC  -   +   OK ");
+    } else {
+      snprintf(line0, sizeof(line0), "SAMPLE: %3u pcs ", sampleCount);
+      snprintf(line1, sizeof(line1), "ESC  -   +   OK ");
+    }
+    line0[16] = '\0';
+    line1[16] = '\0';
+    _lcd->setCursor(0, 0);
+    _lcd->print(line0);
+    _lcd->setCursor(0, 1);
+    _lcd->print(line1);
   }
 
   virtual void showStatus(const char* line1, const char* line2 = nullptr, uint16_t delayMs = 0) override {
