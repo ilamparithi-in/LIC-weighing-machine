@@ -57,6 +57,7 @@
 #define ADC_SATURATION_LIMIT         8388600 // 24-bit ADC saturation boundary (full scale 8,388,607)
 #define FILTER_SIZE                  16      // 16-sample rolling buffer (~400ms window at 40 SPS)
 #define DISPLAY_INTERVAL_MS          100     // 10 Hz display update rate
+#define BUTTON_DEBOUNCE_MS           30      // Mechanical switch debounce integration time (30 ms)
 #define POWER_OFF_HOLD_MS            1500    // 1.5 seconds hold for power off / deep sleep
 #define BOOT_SLEEP_HOLD_MS           POWER_OFF_HOLD_MS
 #define AUTO_SHUTDOWN_TIMEOUT_MS     -1      // inactivity timeout in ms (set <= 0 to disable)

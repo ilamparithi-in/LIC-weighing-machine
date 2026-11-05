@@ -14,6 +14,60 @@
 #include "scale_display.h"
 
 /**
+ * ButtonDebouncer: Finite-state mechanical contact debouncer.
+ * Rejects contact chatter/bounce on press and release transitions,
+ * tracking clean debounced edges and continuous hold durations.
+ */
+struct ButtonDebouncer {
+  uint8_t pin;
+  bool isPressed;                    // Debounced steady state: true = pressed (LOW)
+  bool lastRawState;                 // Last sampled raw reading (LOW = true)
+  unsigned long lastStateChangeTime; // Timestamp when raw reading changed
+  unsigned long pressStartTime;      // Timestamp when debounced press began
+  bool longPressHandled;             // True if a long-press action fired during this press
+
+  void init(uint8_t p) {
+    pin = p;
+    isPressed = false;
+    lastRawState = false;
+    lastStateChangeTime = 0;
+    pressStartTime = 0;
+    longPressHandled = false;
+  }
+
+  // Returns:
+  //   1: Debounced Press Event (transitioned from released to pressed)
+  //  -1: Debounced Release Event (transitioned from pressed to released)
+  //   0: Steady state (no transition)
+  int update(unsigned long now) {
+    bool raw = (digitalRead(pin) == LOW);
+    if (raw != lastRawState) {
+      lastRawState = raw;
+      lastStateChangeTime = now;
+    }
+
+    if ((now - lastStateChangeTime) >= BUTTON_DEBOUNCE_MS) {
+      if (isPressed != raw) {
+        isPressed = raw;
+        if (isPressed) {
+          pressStartTime = now;
+          longPressHandled = false;
+          return 1;
+        } else {
+          return -1;
+        }
+      }
+    }
+    return 0;
+  }
+
+  unsigned long holdDuration(unsigned long now) const {
+    if (!isPressed || pressStartTime == 0) return 0;
+    return (now >= pressStartTime) ? (now - pressStartTime) : 0;
+  }
+};
+
+/**
  * ScaleCore: Encapsulates all load cell signal processing, digital filtering,
  * calibration, tare, button debounce, non-volatile storage, power management,
  * and serial command parsing.
@@ -65,13 +119,11 @@ private:
   float _lastActivityWeight;
   unsigned long _lastDisplayUpdate;
 
-  // Button Management
-  unsigned long _holdPressStartTime;
-  unsigned long _tarePressStartTime;
-  unsigned long _unitPressStartTime;
-  unsigned long _pcsPressStartTime;
-  bool _powerOffTriggered;
-  bool _pcsLongPressTriggered;
+  // Button Debouncers and Management
+  ButtonDebouncer _btnHold;
+  ButtonDebouncer _btnTare;
+  ButtonDebouncer _btnUnit;
+  ButtonDebouncer _btnPcs;
   unsigned long _lastCountdownUpdate;
   bool _isShutdownCountdownActive;
 
@@ -114,12 +166,6 @@ public:
       _lastActivityTime(0),
       _lastActivityWeight(0.0f),
       _lastDisplayUpdate(0),
-      _holdPressStartTime(0),
-      _tarePressStartTime(0),
-      _unitPressStartTime(0),
-      _pcsPressStartTime(0),
-      _powerOffTriggered(false),
-      _pcsLongPressTriggered(false),
       _lastCountdownUpdate(0),
       _isShutdownCountdownActive(false),
       _lastPowerPulseTime(0),
@@ -151,6 +197,11 @@ public:
     pinMode(UNIT_BUTTON_PIN, INPUT_PULLUP);
     pinMode(PCS_BUTTON_PIN, INPUT_PULLUP);
 
+    _btnHold.init(HOLD_BUTTON_PIN);
+    _btnTare.init(TARE_BUTTON_PIN);
+    _btnUnit.init(UNIT_BUTTON_PIN);
+    _btnPcs.init(PCS_BUTTON_PIN);
+
 #ifdef POWER_BANK_PULSE_PIN
     // 3b. Configure Power Bank keep-alive pulse pin (default high-Z input)
     pinMode(POWER_BANK_PULSE_PIN, INPUT);
@@ -167,6 +218,12 @@ public:
       delay(10);
     }
     delay(50);
+
+    // Re-initialize button debouncers clean after wake release
+    _btnHold.init(HOLD_BUTTON_PIN);
+    _btnTare.init(TARE_BUTTON_PIN);
+    _btnUnit.init(UNIT_BUTTON_PIN);
+    _btnPcs.init(PCS_BUTTON_PIN);
 
     // 4. Initialize Hardware I2C Bus at 400kHz
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
@@ -733,6 +790,12 @@ public:
     _wizardStartTime = millis();
     if (_sampleCount == 0) _sampleCount = DEFAULT_SAMPLE_COUNT;
 
+    // Suppress release actions for any buttons currently held down during transition
+    if (_btnHold.isPressed) _btnHold.longPressHandled = true;
+    if (_btnTare.isPressed) _btnTare.longPressHandled = true;
+    if (_btnUnit.isPressed) _btnUnit.longPressHandled = true;
+    if (_btnPcs.isPressed)  _btnPcs.longPressHandled  = true;
+
     Serial.printf("[WIZARD] Started Sample Wizard. Target: %u pcs (continuously variable 1..9999).\n", _sampleCount);
     Serial.printf("[WIZARD] 4-Button Controls: [ESC: GPIO %d] [-: GPIO %d] [+: GPIO %d] [OK: GPIO %d]\n",
                   NAV_BTN_CANCEL, NAV_BTN_DEC, NAV_BTN_INC, NAV_BTN_CONFIRM);
@@ -745,6 +808,12 @@ public:
     if (!success && _operatingMode == MODE_PCS && _pieceWeight <= 0.0001f) {
       _operatingMode = MODE_WEIGHING;
     }
+
+    // Suppress release actions for any buttons currently held down during transition
+    if (_btnHold.isPressed) _btnHold.longPressHandled = true;
+    if (_btnTare.isPressed) _btnTare.longPressHandled = true;
+    if (_btnUnit.isPressed) _btnUnit.longPressHandled = true;
+    if (_btnPcs.isPressed)  _btnPcs.longPressHandled  = true;
   }
 
   bool calibratePcsWithSample(uint16_t count) {
@@ -1114,236 +1183,219 @@ private:
     }
   }
 
-  void handleButtonAction(uint8_t pin) {
-    if (pin == HOLD_BUTTON_PIN) {
-      toggleHold();
-    } else if (pin == TARE_BUTTON_PIN) {
-      Serial.println("[BUTTON] Tare requested via button click.");
-      performTare();
-    } else if (pin == UNIT_BUTTON_PIN) {
-      Serial.println("[BUTTON] Unit cycle requested via button click.");
-      cycleUnit();
-    } else if (pin == PCS_BUTTON_PIN) {
-      Serial.println("[BUTTON] PCS mode toggle requested via button click.");
-      togglePcsMode();
-    }
+  ButtonDebouncer* getPowerOffDebouncer() {
+    if (POWER_OFF_BUTTON_PIN == HOLD_BUTTON_PIN) return &_btnHold;
+    if (POWER_OFF_BUTTON_PIN == TARE_BUTTON_PIN) return &_btnTare;
+    if (POWER_OFF_BUTTON_PIN == UNIT_BUTTON_PIN) return &_btnUnit;
+    if (POWER_OFF_BUTTON_PIN == PCS_BUTTON_PIN)  return &_btnPcs;
+    return &_btnHold;
   }
 
-  void handleWizardButton(uint8_t pin) {
-    _wizardStartTime = millis();
-    resetActivityTimer();
+  void checkNormalButtons(int evHold, int evTare, int evUnit, int evPcs, unsigned long now) {
+    ButtonDebouncer* pwrBtn = getPowerOffDebouncer();
 
-    if (pin == NAV_BTN_CANCEL) {
-      Serial.println("[WIZARD] Cancel requested (ESC). Exiting wizard.");
-      exitSampleWizard(false);
-      if (_display) {
-        _display->showStatus("CANCELLED", nullptr, 600);
+    // 1. Check long-press power off / deep sleep countdown while power button is held
+    if (pwrBtn && pwrBtn->isPressed) {
+      unsigned long holdMs = pwrBtn->holdDuration(now);
+      if (holdMs >= 700 && holdMs < POWER_OFF_HOLD_MS) {
+        _isShutdownCountdownActive = true;
+        if (now - _lastCountdownUpdate >= 50) {
+          _lastCountdownUpdate = now;
+          if (_display) {
+            _display->showShutdownCountdown((uint16_t)holdMs, (uint16_t)POWER_OFF_HOLD_MS);
+          }
+        }
+      } else if (holdMs >= POWER_OFF_HOLD_MS && !pwrBtn->longPressHandled) {
+        pwrBtn->longPressHandled = true;
+        _isShutdownCountdownActive = false;
+        enterSleepMode();
       }
-    } else if (pin == NAV_BTN_CONFIRM) {
-      Serial.printf("[WIZARD] Confirming reference sample for %u pcs...\n", _sampleCount);
-      calibratePcsWithSample(_sampleCount);
+    }
+
+    // 2. HOLD Button (Pin 1)
+    if (evHold == -1) {
+      if (pwrBtn == &_btnHold) {
+        _isShutdownCountdownActive = false;
+      }
+      if (!_btnHold.longPressHandled) {
+        toggleHold();
+      }
+      _btnHold.longPressHandled = false;
+    }
+
+    // 3. TARE Button (Pin 0)
+    if (evTare == -1) {
+      if (pwrBtn == &_btnTare) {
+        _isShutdownCountdownActive = false;
+      }
+      if (!_btnTare.longPressHandled) {
+        Serial.println("[BUTTON] Tare requested via button click.");
+        performTare();
+      }
+      _btnTare.longPressHandled = false;
+    }
+
+    // 4. UNIT Button (Pin 6)
+    if (evUnit == -1) {
+      if (pwrBtn == &_btnUnit) {
+        _isShutdownCountdownActive = false;
+      }
+      if (!_btnUnit.longPressHandled) {
+        Serial.println("[BUTTON] Unit cycle requested via button click.");
+        cycleUnit();
+      }
+      _btnUnit.longPressHandled = false;
+    }
+
+    // 5. PCS Button (Pin 5): Long-press check & Click Release
+    if (_btnPcs.isPressed) {
+      unsigned long holdMs = _btnPcs.holdDuration(now);
+      if (holdMs >= PCS_SETUP_HOLD_MS && !_btnPcs.longPressHandled) {
+        _btnPcs.longPressHandled = true;
+        Serial.println("[BUTTON] PCS long-press detected (>=1.0s). Entering Sample Wizard...");
+        startSampleWizard();
+      }
+    }
+
+    if (evPcs == -1) {
+      if (pwrBtn == &_btnPcs) {
+        _isShutdownCountdownActive = false;
+      }
+      if (!_btnPcs.longPressHandled) {
+        Serial.println("[BUTTON] PCS button click detected.");
+        togglePcsMode();
+      }
+      _btnPcs.longPressHandled = false;
     }
   }
 
-  void processWizardContinuousNav() {
-    unsigned long now = millis();
+  void checkWizardButtons(int evHold, int evTare, int evUnit, int evPcs, unsigned long now) {
+    // 1. CANCEL / ESC (NAV_BTN_CANCEL, GPIO 1, _btnHold)
+    if (evHold == -1) {
+      if (!_btnHold.longPressHandled) {
+        Serial.println("[WIZARD] Cancel requested (ESC). Exiting wizard.");
+        exitSampleWizard(false);
+        if (_display) {
+          _display->showStatus("CANCELLED", nullptr, 600);
+        }
+      }
+      _btnHold.longPressHandled = false;
+    }
 
-    // --- 1. Increment Button (NAV_BTN_INC, GPIO 6) ---
-    if (digitalRead(NAV_BTN_INC) == LOW) {
-      resetActivityTimer();
+    // 2. CONFIRM / OK (NAV_BTN_CONFIRM, GPIO 5, _btnPcs)
+    if (evPcs == -1) {
+      if (!_btnPcs.longPressHandled) {
+        Serial.printf("[WIZARD] Confirming reference sample for %u pcs...\n", _sampleCount);
+        calibratePcsWithSample(_sampleCount);
+      }
+      _btnPcs.longPressHandled = false;
+    }
+
+    // 3. INCREMENT [+] (NAV_BTN_INC, GPIO 6, _btnUnit)
+    if (evUnit == 1) {
+      // Debounced single click: exactly 1 step
       _wizardStartTime = now;
-      if (_unitPressStartTime == 0) {
-        // Initial Press: instantaneous +1 step
-        _unitPressStartTime = now;
-        _incLastRepeatTime = now;
-        if (_sampleCount < 9999) _sampleCount++;
-        Serial.printf("[WIZARD] Sample Count [+]: %u pcs\n", _sampleCount);
-        updateWizardDisplay();
-      } else {
-        // Continuously Held: Adaptive Acceleration Curve
-        unsigned long holdMs = now - _unitPressStartTime;
-        const unsigned long INITIAL_DWELL_MS = 400; // 400ms dwell before auto-repeat
-
-        if (holdMs >= INITIAL_DWELL_MS) {
-          uint16_t step = 1;
-          unsigned long interval = 130;
-
-          if (holdMs >= 5000) {
-            step = 50;
-            interval = 60;
-          } else if (holdMs >= 3000) {
-            step = 10;
-            interval = 70;
-          } else if (holdMs >= 1500) {
-            step = 2;
-            interval = 90;
-          } else {
-            step = 1;
-            interval = 130;
-          }
-
-          if (now - _incLastRepeatTime >= interval) {
-            _incLastRepeatTime = now;
-            if ((uint32_t)_sampleCount + step > 9999) {
-              _sampleCount = 9999;
-            } else {
-              _sampleCount += step;
-            }
-            updateWizardDisplay();
-          }
-        }
-      }
-    } else {
-      _unitPressStartTime = 0;
-    }
-
-    // --- 2. Decrement Button (NAV_BTN_DEC, GPIO 0) ---
-    if (digitalRead(NAV_BTN_DEC) == LOW) {
-      resetActivityTimer();
+      _incLastRepeatTime = now;
+      if (_sampleCount < 9999) _sampleCount++;
+      Serial.printf("[WIZARD] Sample Count [+]: %u pcs\n", _sampleCount);
+      updateWizardDisplay();
+    } else if (_btnUnit.isPressed) {
+      // Continuous hold: adaptive auto-repeat acceleration curve
       _wizardStartTime = now;
-      if (_tarePressStartTime == 0) {
-        // Initial Press: instantaneous -1 step
-        _tarePressStartTime = now;
-        _decLastRepeatTime = now;
-        if (_sampleCount > 1) _sampleCount--;
-        Serial.printf("[WIZARD] Sample Count [-]: %u pcs\n", _sampleCount);
-        updateWizardDisplay();
-      } else {
-        // Continuously Held: Adaptive Acceleration Curve
-        unsigned long holdMs = now - _tarePressStartTime;
-        const unsigned long INITIAL_DWELL_MS = 400; // 400ms dwell before auto-repeat
+      unsigned long holdMs = _btnUnit.holdDuration(now);
+      const unsigned long INITIAL_DWELL_MS = 400; // 400ms dwell before auto-repeat
 
-        if (holdMs >= INITIAL_DWELL_MS) {
-          uint16_t step = 1;
-          unsigned long interval = 130;
+      if (holdMs >= INITIAL_DWELL_MS) {
+        uint16_t step = 1;
+        unsigned long interval = 130;
 
-          if (holdMs >= 5000) {
-            step = 50;
-            interval = 60;
-          } else if (holdMs >= 3000) {
-            step = 10;
-            interval = 70;
-          } else if (holdMs >= 1500) {
-            step = 2;
-            interval = 90;
+        if (holdMs >= 5000) {
+          step = 50;
+          interval = 60;
+        } else if (holdMs >= 3000) {
+          step = 10;
+          interval = 70;
+        } else if (holdMs >= 1500) {
+          step = 2;
+          interval = 90;
+        } else {
+          step = 1;
+          interval = 130;
+        }
+
+        if (now - _incLastRepeatTime >= interval) {
+          _incLastRepeatTime = now;
+          if ((uint32_t)_sampleCount + step > 9999) {
+            _sampleCount = 9999;
           } else {
-            step = 1;
-            interval = 130;
+            _sampleCount += step;
           }
-
-          if (now - _decLastRepeatTime >= interval) {
-            _decLastRepeatTime = now;
-            if (_sampleCount > step) {
-              _sampleCount -= step;
-            } else {
-              _sampleCount = 1;
-            }
-            updateWizardDisplay();
-          }
-        }
-      }
-    } else {
-      _tarePressStartTime = 0;
-    }
-  }
-
-  void checkWizardButton(uint8_t pin, unsigned long& pressStartTime) {
-    if (digitalRead(pin) == LOW) {
-      resetActivityTimer();
-      _wizardStartTime = millis();
-      if (pressStartTime == 0) {
-        pressStartTime = millis();
-      }
-    } else {
-      if (pressStartTime > 0) {
-        unsigned long duration = millis() - pressStartTime;
-        pressStartTime = 0;
-        if (duration >= 80) {
-          handleWizardButton(pin);
+          updateWizardDisplay();
         }
       }
     }
-  }
 
-  void checkPcsButton(uint8_t pin, unsigned long& pressStartTime) {
-    if (digitalRead(pin) == LOW) {
-      resetActivityTimer();
-      if (pressStartTime == 0) {
-        pressStartTime = millis();
-        _pcsLongPressTriggered = false;
-      } else {
-        unsigned long holdMs = millis() - pressStartTime;
-        if (holdMs >= PCS_SETUP_HOLD_MS && !_pcsLongPressTriggered) {
-          _pcsLongPressTriggered = true;
-          Serial.println("[BUTTON] PCS long-press detected (>=1.0s). Entering Sample Wizard...");
-          startSampleWizard();
-        }
-      }
-    } else {
-      if (pressStartTime > 0) {
-        unsigned long duration = millis() - pressStartTime;
-        pressStartTime = 0;
-        if (!_pcsLongPressTriggered && duration >= 80 && duration < PCS_SETUP_HOLD_MS) {
-          Serial.println("[BUTTON] PCS button click detected.");
-          togglePcsMode();
-        }
-        _pcsLongPressTriggered = false;
-      }
-    }
-  }
+    // 4. DECREMENT [-] (NAV_BTN_DEC, GPIO 0, _btnTare)
+    if (evTare == 1) {
+      // Debounced single click: exactly 1 step
+      _wizardStartTime = now;
+      _decLastRepeatTime = now;
+      if (_sampleCount > 1) _sampleCount--;
+      Serial.printf("[WIZARD] Sample Count [-]: %u pcs\n", _sampleCount);
+      updateWizardDisplay();
+    } else if (_btnTare.isPressed) {
+      // Continuous hold: adaptive auto-repeat acceleration curve
+      _wizardStartTime = now;
+      unsigned long holdMs = _btnTare.holdDuration(now);
+      const unsigned long INITIAL_DWELL_MS = 400; // 400ms dwell before auto-repeat
 
-  void checkSingleButton(uint8_t pin, unsigned long& pressStartTime) {
-    if (digitalRead(pin) == LOW) {
-      resetActivityTimer();
-      if (pressStartTime == 0) {
-        pressStartTime = millis();
-        if (pin == POWER_OFF_BUTTON_PIN) {
-          _powerOffTriggered = false;
+      if (holdMs >= INITIAL_DWELL_MS) {
+        uint16_t step = 1;
+        unsigned long interval = 130;
+
+        if (holdMs >= 5000) {
+          step = 50;
+          interval = 60;
+        } else if (holdMs >= 3000) {
+          step = 10;
+          interval = 70;
+        } else if (holdMs >= 1500) {
+          step = 2;
+          interval = 90;
+        } else {
+          step = 1;
+          interval = 130;
         }
-      } else if (pin == POWER_OFF_BUTTON_PIN) {
-        unsigned long holdMs = millis() - pressStartTime;
-        if (holdMs >= 700 && holdMs < POWER_OFF_HOLD_MS) {
-          _isShutdownCountdownActive = true;
-          if (millis() - _lastCountdownUpdate >= 50) {
-            _lastCountdownUpdate = millis();
-            if (_display) {
-              _display->showShutdownCountdown((uint16_t)holdMs, (uint16_t)POWER_OFF_HOLD_MS);
-            }
+
+        if (now - _decLastRepeatTime >= interval) {
+          _decLastRepeatTime = now;
+          if (_sampleCount > step) {
+            _sampleCount -= step;
+          } else {
+            _sampleCount = 1;
           }
-        } else if (holdMs >= POWER_OFF_HOLD_MS && !_powerOffTriggered) {
-          _powerOffTriggered = true;
-          _isShutdownCountdownActive = false;
-          enterSleepMode();
-        }
-      }
-    } else {
-      if (pressStartTime > 0) {
-        unsigned long duration = millis() - pressStartTime;
-        pressStartTime = 0;
-        if (pin == POWER_OFF_BUTTON_PIN) {
-          _isShutdownCountdownActive = false;
-        }
-        bool triggeredShutdown = (pin == POWER_OFF_BUTTON_PIN && _powerOffTriggered);
-        if (!triggeredShutdown && duration >= 80 && duration < POWER_OFF_HOLD_MS) {
-          handleButtonAction(pin);
-        }
-        if (pin == POWER_OFF_BUTTON_PIN) {
-          _powerOffTriggered = false;
+          updateWizardDisplay();
         }
       }
     }
   }
 
   void checkButtons() {
+    unsigned long now = millis();
+
+    int evHold = _btnHold.update(now);
+    int evTare = _btnTare.update(now);
+    int evUnit = _btnUnit.update(now);
+    int evPcs  = _btnPcs.update(now);
+
+    if (_btnHold.isPressed || _btnTare.isPressed || _btnUnit.isPressed || _btnPcs.isPressed) {
+      resetActivityTimer();
+    }
+
     if (_inSampleWizard) {
-      processWizardContinuousNav();
-      checkWizardButton(NAV_BTN_CANCEL, _holdPressStartTime);
-      checkWizardButton(NAV_BTN_CONFIRM, _pcsPressStartTime);
+      checkWizardButtons(evHold, evTare, evUnit, evPcs, now);
     } else {
-      checkSingleButton(HOLD_BUTTON_PIN, _holdPressStartTime);
-      checkSingleButton(TARE_BUTTON_PIN, _tarePressStartTime);
-      checkSingleButton(UNIT_BUTTON_PIN, _unitPressStartTime);
-      checkPcsButton(PCS_BUTTON_PIN, _pcsPressStartTime);
+      checkNormalButtons(evHold, evTare, evUnit, evPcs, now);
     }
   }
 
