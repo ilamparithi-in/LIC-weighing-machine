@@ -83,6 +83,7 @@ private:
   int32_t _tareOffset;
   bool _isCalibrated;
   WeightUnit _currentUnit;
+  uint16_t _tareAnimDurationMs;
 
   // Operating Mode & PCS (Piece Counting) State
   ScaleOperatingMode _operatingMode;
@@ -143,6 +144,7 @@ public:
       _tareOffset(DEFAULT_TARE_OFFSET),
       _isCalibrated(true),
       _currentUnit(UNIT_G),
+      _tareAnimDurationMs(DEFAULT_TARE_ANIM_MS),
       _operatingMode(MODE_WEIGHING),
       _pieceWeight(0.0f),
       _sampleCount(DEFAULT_SAMPLE_COUNT),
@@ -484,31 +486,67 @@ public:
     }
   }
 
+  uint16_t getTareAnimDurationMs() const { return _tareAnimDurationMs; }
+  void setTareAnimDurationMs(uint16_t durationMs) {
+    if (durationMs > MAX_TARE_ANIM_MS) durationMs = MAX_TARE_ANIM_MS;
+    _tareAnimDurationMs = durationMs;
+    saveSettings();
+    Serial.printf("[CONFIG] Tare animation duration set to %u ms (%s)\n",
+                  _tareAnimDurationMs,
+                  (_tareAnimDurationMs == 0) ? "Instant" :
+                  (_tareAnimDurationMs <= 60) ? "Ultra Quick" :
+                  (_tareAnimDurationMs <= 120) ? "Super Quick" :
+                  (_tareAnimDurationMs <= 250) ? "Normal" : "Slow");
+  }
+
   void performTare() {
     Serial.println("[ACTION] Performing Tare (Zeroing)...");
     if (_isHeld) _isHeld = false;
-    float startWeight = _lockedWeight;
 
-    // Collect 14 samples and animate smooth fall down to 0
-    const int TARE_SAMPLES = 14;
-    int32_t samples[TARE_SAMPLES];
+    // Start animating smoothly from current displayed weight down to 0
+    float startWeight = _lockedWeight;
+    if (fabsf(startWeight) < 0.001f) {
+      float netCounts = _filteredADC - (float)_tareOffset - _autoZeroCorrection;
+      startWeight = (_scaleFactor != 0) ? (netCounts / _scaleFactor) : 0.0f;
+    }
+
+    // High-precision ADC sampling buffer (metrology accuracy is completely decoupled from UI animation)
+    int32_t samples[TARE_ACCURACY_SAMPLES];
     int validSamples = 0;
     unsigned long start = millis();
+    unsigned long animStart = start;
+    unsigned long lastFrameTime = 0;
+    const unsigned long FRAME_INTERVAL_MS = 18; // ~55 FPS smooth slide
+    bool animCompleted = (_tareAnimDurationMs == 0 || fabsf(startWeight) < 0.001f);
 
-    while (validSamples < TARE_SAMPLES && (millis() - start < 1500)) {
+    if (animCompleted && _display) {
+      _display->showTareProgress(0.0f, _currentUnit);
+    }
+
+    while (validSamples < TARE_ACCURACY_SAMPLES && (millis() - start < 1500)) {
       int32_t val;
-      if (_scale.readRaw(val, 80)) {
+      // Non-blocking 5ms raw read so animation timer runs smoothly
+      if (_scale.readRaw(val, 5)) {
         samples[validSamples++] = val;
+      }
 
-        float progress = (float)validSamples / (float)TARE_SAMPLES;
-        float remain = 1.0f - progress;
-        float animWeight = startWeight * remain * remain;
-
-        if (_display) {
-          _display->showTareProgress(animWeight, _currentUnit);
+      // Update slide animation based on elapsed wall-clock time (independent of ADC sample rate)
+      if (!animCompleted && _display) {
+        unsigned long now = millis();
+        if (now - lastFrameTime >= FRAME_INTERVAL_MS) {
+          lastFrameTime = now;
+          unsigned long elapsed = now - animStart;
+          if (elapsed >= _tareAnimDurationMs) {
+            animCompleted = true;
+            _display->showTareProgress(0.0f, _currentUnit);
+          } else {
+            float progress = (float)elapsed / (float)_tareAnimDurationMs;
+            float remain = 1.0f - progress;
+            float animWeight = startWeight * remain * remain;
+            _display->showTareProgress(animWeight, _currentUnit);
+          }
         }
       }
-      delay(5);
     }
 
     if (validSamples >= 8) {
@@ -523,7 +561,7 @@ public:
         samples[j + 1] = key;
       }
 
-      // Discard top 20% and bottom 20% outliers
+      // Discard top 20% and bottom 20% outliers for maximum metrological accuracy
       int drop = validSamples / 5;
       long sum = 0;
       int used = 0;
@@ -980,8 +1018,10 @@ public:
     _sampleCount = _prefs.getUShort("sample_cnt", DEFAULT_SAMPLE_COUNT);
     uint8_t opMode = _prefs.getUChar("mode", (uint8_t)MODE_WEIGHING);
     _operatingMode = (opMode == (uint8_t)MODE_PCS && _pieceWeight > 0.0001f) ? MODE_PCS : MODE_WEIGHING;
+    _tareAnimDurationMs = _prefs.getUShort("tare_anim_ms", DEFAULT_TARE_ANIM_MS);
     _prefs.end();
 
+    if (_tareAnimDurationMs > MAX_TARE_ANIM_MS) _tareAnimDurationMs = MAX_TARE_ANIM_MS;
     if (_scaleFactor <= 0.1f) _scaleFactor = DEFAULT_SCALE_FACTOR;
     if (_currentUnit > UNIT_LB) _currentUnit = UNIT_G;
 
@@ -990,10 +1030,10 @@ public:
       _scale.setTareOffset(_tareOffset);
     }
 
-    Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Unit: %s | Mode: %s | APW: %.4fg (Ref: %u pcs) | Calibrated: %s\n",
+    Serial.printf("[CONFIG] Loaded Settings -> Factor: %.4f | Offset: %ld | Unit: %s | Mode: %s | APW: %.4fg (Ref: %u pcs) | TareAnim: %u ms | Calibrated: %s\n",
                   _scaleFactor, (long)_tareOffset, getUnitSymbol(_currentUnit),
                   (_operatingMode == MODE_PCS) ? "PCS" : "WEIGH", _pieceWeight, _sampleCount,
-                  _isCalibrated ? "YES" : "NO");
+                  _tareAnimDurationMs, _isCalibrated ? "YES" : "NO");
   }
 
   void saveSettings() {
@@ -1005,6 +1045,7 @@ public:
     _prefs.putFloat("piece_wt", _pieceWeight);
     _prefs.putUShort("sample_cnt", _sampleCount);
     _prefs.putUChar("mode", (uint8_t)_operatingMode);
+    _prefs.putUShort("tare_anim_ms", _tareAnimDurationMs);
     _prefs.end();
     Serial.println("[CONFIG] Saved settings to Non-Volatile Flash.");
   }
@@ -1047,6 +1088,7 @@ public:
     Serial.println();
     Serial.println("--- SERIAL COMMANDS ---");
     Serial.println("  t              : Tare (zero) scale");
+    Serial.println("  tarespeed [ms] : Get/set tare animation slide duration (e.g., 'tarespeed 100', 'tarespeed quick')");
     Serial.println("  u              : Cycle unit (g -> kg -> oz -> lb)");
     Serial.println("  pcs            : Toggle / switch to PCS piece counting mode");
     Serial.println("  sample <count> : Calibrate APW with current load as <count> pieces (e.g. 'sample 25')");
@@ -1405,6 +1447,41 @@ private:
 
     if (cmd.equalsIgnoreCase("t") || cmd.equalsIgnoreCase("tare")) {
       performTare();
+    } else if (cmd.equalsIgnoreCase("tarespeed") || cmd.equalsIgnoreCase("tareanim")) {
+      Serial.println("--------------------------------------------------");
+      Serial.printf("  [TARE ANIMATION] Duration: %u ms (%s)\n",
+                    _tareAnimDurationMs,
+                    (_tareAnimDurationMs == 0) ? "Instant" :
+                    (_tareAnimDurationMs <= 60) ? "Ultra Quick" :
+                    (_tareAnimDurationMs <= 120) ? "Super Quick (Default)" : "Quick Slide (Max 200ms)");
+      Serial.printf("  [TARE METROLOGY] Accuracy: %d samples (Trimmed Mean, Decoupled)\n", TARE_ACCURACY_SAMPLES);
+      Serial.println("  Usage: tarespeed <ms | instant | ultra | quick | fast | max>");
+      Serial.println("--------------------------------------------------");
+    } else if (cmd.startsWith("tarespeed ") || cmd.startsWith("tareanim ") ||
+               cmd.startsWith("tare speed ") || cmd.startsWith("tare anim ")) {
+      int spaceIdx = cmd.lastIndexOf(' ');
+      String arg = cmd.substring(spaceIdx + 1);
+      arg.trim();
+      arg.toLowerCase();
+      if (arg == "instant" || arg == "off" || arg == "none") {
+        setTareAnimDurationMs(0);
+      } else if (arg == "ultra" || arg == "fastest") {
+        setTareAnimDurationMs(50);
+      } else if (arg == "quick" || arg == "super") {
+        setTareAnimDurationMs(100);
+      } else if (arg == "fast") {
+        setTareAnimDurationMs(150);
+      } else if (arg == "normal" || arg == "max") {
+        setTareAnimDurationMs(200);
+      } else {
+        int val = arg.toInt();
+        if (val >= MIN_TARE_ANIM_MS && val <= MAX_TARE_ANIM_MS) {
+          setTareAnimDurationMs((uint16_t)val);
+        } else {
+          Serial.printf("[ERROR] Enter duration between %d and %d ms, or instant/ultra/quick/fast/max (e.g. 'tarespeed 100')\n",
+                        MIN_TARE_ANIM_MS, MAX_TARE_ANIM_MS);
+        }
+      }
     } else if (cmd.equalsIgnoreCase("u") || cmd.equalsIgnoreCase("unit")) {
       cycleUnit();
     } else if (cmd.equalsIgnoreCase("pcs")) {

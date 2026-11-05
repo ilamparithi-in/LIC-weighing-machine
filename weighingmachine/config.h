@@ -83,6 +83,12 @@
 #define DEFAULT_TARE_OFFSET      81628   // Default tare offset
 #define PREFS_NAMESPACE          "scale_cfg"
 
+// ---------------------- TARE CONFIGURATION -------------------
+#define TARE_ACCURACY_SAMPLES        14      // High-precision ADC samples for tare zeroing (with outlier rejection)
+#define DEFAULT_TARE_ANIM_MS         100     // Super-quick slide animation duration in ms (decoupled from calculation)
+#define MIN_TARE_ANIM_MS             0       // Minimum slide animation duration (0 = instant zero)
+#define MAX_TARE_ANIM_MS             200     // Maximum slide animation duration in ms (capped to 200ms)
+
 // ---------------------- PCS COUNTING CONFIGURATION -----------
 #define PCS_SETUP_HOLD_MS            1000    // Long press on PCS button to enter wizard (1.0 second)
 #define SAMPLE_SETUP_TIMEOUT_MS      -1      // Wizard inactivity timeout in ms (set <= 0 to disable)

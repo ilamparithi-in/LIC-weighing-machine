@@ -117,6 +117,7 @@ In [weighingmachine/config.h](file:///home/ilam_common/DevHome/GitHub/weighingma
 | Command | Arguments | Description |
 | :--- | :--- | :--- |
 | `t` or `tare` | None | Zero (Tare) the scale |
+| `tarespeed [ms]` | Integer / String | Configure tare slide animation speed (e.g. `tarespeed 100`, `tarespeed quick`) |
 | `u` or `unit` | None | Cycle active unit (`g` -> `kg` -> `oz` -> `lb`) |
 | `pcs` | None | Toggle / enter PCS piece counting mode |
 | `sample <count>` | Integer | Calibrate APW with current load as `<count>` pieces (e.g., `sample 25`) |
