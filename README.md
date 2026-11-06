@@ -2,6 +2,9 @@
 
 A high-precision, production-grade digital weighing scale firmware running on the **ESP32-C3 SuperMini**, reading a 4-wire strain gauge load cell via the **7Semi NAU7802 24-bit ADC Breakout**, featuring a **pluggable display architecture** that seamlessly supports both **I2C 16x2 LCD** (PCF8574) and **0.91" I2C OLED** (SSD1306 128x32).
 
+<img height="400" alt="image" src="https://github.com/user-attachments/assets/e9ff846f-b00a-4952-9d4a-050d085b2515" />
+<img height="400" alt="image" src="https://github.com/user-attachments/assets/1e24b594-e967-424a-8057-220f424ddef8" />
+
 ---
 
 ## 1. Hardware Architecture & Wiring
